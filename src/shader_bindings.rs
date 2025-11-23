@@ -29,33 +29,3 @@ pub fn renderer_set_0_layouts() -> Vec<DescriptorSetLayoutCreateInfo> {
 
     vec![ubo_layout]
 }
-
-pub fn mrt_set_1_layouts() -> Vec<DescriptorSetLayoutCreateInfo> {
-    let sampler_layout = {
-        let mut norm = DescriptorSetLayoutBinding::descriptor_type(
-            DescriptorType::CombinedImageSampler,
-        );
-        norm.descriptor_count = 1;
-        norm.stages = ShaderStages::FRAGMENT;
-
-        let mut uvs = DescriptorSetLayoutBinding::descriptor_type(
-            DescriptorType::CombinedImageSampler,
-        );
-        uvs.descriptor_count = 1;
-        uvs.stages = ShaderStages::FRAGMENT;
-
-        let mut depth = DescriptorSetLayoutBinding::descriptor_type(
-            DescriptorType::CombinedImageSampler,
-        );
-        depth.descriptor_count = 1;
-        depth.stages = ShaderStages::FRAGMENT;
-
-        let mut info = DescriptorSetLayoutCreateInfo::default();
-        info.bindings.insert(0, norm);
-        info.bindings.insert(1, uvs);
-        info.bindings.insert(2, depth);
-        info
-    };
-
-    vec![sampler_layout]
-}

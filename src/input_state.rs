@@ -1,4 +1,4 @@
-use winit::event::{ElementState, WindowEvent, MouseButton, DeviceEvent};
+use winit::event::{ElementState, WindowEvent, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 

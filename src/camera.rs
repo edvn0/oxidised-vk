@@ -1,7 +1,6 @@
 use crate::input_state::InputState;
 use crate::math::perspective;
 use nalgebra::{Matrix4, Point3, Vector3};
-use std::f32::consts::{self, PI};
 
 pub struct Camera {
     pub position: Vector3<f32>,
