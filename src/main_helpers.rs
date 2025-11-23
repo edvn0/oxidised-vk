@@ -22,9 +22,8 @@ impl FrameDescriptorSet {
         let sets: Vec<_> = uniform_buffers
             .iter()
             .map(|ub| {
-                let mut writes = Vec::new();
-                writes.push(WriteDescriptorSet::buffer(0, ub.clone()));
-                DescriptorSet::new(descriptor_set_allocator.clone(), layout.clone(), writes, [])
+                let vec = vec![WriteDescriptorSet::buffer(0, ub.clone())];
+                DescriptorSet::new(descriptor_set_allocator.clone(), layout.clone(), vec, [])
                     .unwrap()
             })
             .collect();

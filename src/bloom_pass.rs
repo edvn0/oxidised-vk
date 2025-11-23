@@ -78,10 +78,10 @@ impl BloomPass {
         };
 
         let mut mip_views: Vec<Arc<ImageView>> = Vec::with_capacity(mip_count);
-        for i in 0..mip_count {
+        (0..mip_count).for_each(|i| {
             let (mw, mh) = mip_sizes[i];
             mip_views.push(create_image(allocator, mw, mh));
-        }
+        });
 
         // Linear sampler with clamp-to-edge for bilinear filtering
         let sampler = Sampler::new(

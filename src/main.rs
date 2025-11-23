@@ -15,20 +15,19 @@ use std::collections::BTreeMap;
 use std::default::Default;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use glm::all;
+use vulkano::command_buffer::{ClearColorImageInfo, PrimaryCommandBufferAbstract};
 use vulkano::descriptor_set::layout::DescriptorType::CombinedImageSampler;
-use vulkano::format::{ClearValue, FormatFeatures};
+use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
     SamplerMipmapMode, SamplerReductionMode,
 };
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{ImageAspects, ImageSubresourceRange};
+use vulkano::image::{ImageAspects, ImageSubresourceRange, SampleCount};
 use vulkano::instance::InstanceExtensions;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::shader::ShaderStage;
 use vulkano::{
     DeviceSize, Validated, Version, VulkanError, VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -551,8 +550,18 @@ impl ApplicationHandler for App {
             ),
             default_sampler,
             frame_transforms: ssbos,
-            white_image_sampler: create_image(&self.memory_allocator, 0xFF),
-            black_image_sampler: create_image(&self.memory_allocator, 0x00),
+            white_image_sampler: create_image(
+                &self.queue,
+                &self.command_buffer_allocator,
+                &self.memory_allocator,
+                0xFF,
+            ),
+            black_image_sampler: create_image(
+                &self.queue,
+                &self.command_buffer_allocator,
+                &self.memory_allocator,
+                0x00,
+            ),
             frame_uniform_buffers: uniform_buffers,
             mrt_pass: mrt,
             mrt_lighting,
@@ -571,14 +580,13 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::KeyboardInput { .. } => {
-                if let WindowEvent::KeyboardInput { event, .. } = &event {
-                    if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
-                        && event.state == ElementState::Pressed
-                        && !event.repeat
-                    {
-                        event_loop.exit();
-                        return;
-                    }
+                if let WindowEvent::KeyboardInput { event, .. } = &event
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    event_loop.exit();
+                    return;
                 }
                 self.input_state.process_input(&event);
                 self.input_state
@@ -607,10 +615,10 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            if self.input_state.rotating {
-                self.input_state.mouse_delta = (delta.0 as f32, delta.1 as f32);
-            }
+        if let DeviceEvent::MouseMotion { delta } = event
+            && self.input_state.rotating
+        {
+            self.input_state.mouse_delta = (delta.0 as f32, delta.1 as f32);
         }
     }
 
@@ -620,11 +628,62 @@ impl ApplicationHandler for App {
     }
 }
 
-fn create_image(allocator: &Arc<StandardMemoryAllocator>, value: i32) -> Arc<ImageView> {
-    let img = Image::new(allocator.clone(), ImageCreateInfo {}, AllocationCreateInfo {})
+fn create_image(
+    queue: &Arc<Queue>,
+    cb_allocator: &Arc<StandardCommandBufferAllocator>,
+    allocator: &Arc<StandardMemoryAllocator>,
+    value: i32,
+) -> Arc<ImageView> {
+    let img = Image::new(
+        allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_UNORM,
+            extent: [1, 1, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+            initial_layout: vulkano::image::ImageLayout::Undefined,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    {
+        // Perform a clear to the specified value
+        let mut builder = AutoCommandBufferBuilder::primary(
+            cb_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
         .unwrap();
 
-img.
+        let val_as_f32 = if value > 1 {
+            value as f32 / 255.0
+        } else {
+            value as f32
+        };
+
+        let mut clear_info = ClearColorImageInfo::image(img.clone());
+        clear_info.clear_value =
+            ClearColorValue::Float([val_as_f32, val_as_f32, val_as_f32, 1.0f32]);
+
+        builder.clear_color_image(clear_info).unwrap();
+
+        let result = builder.build().unwrap().execute(queue.clone()).unwrap();
+        result
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+    }
+
     ImageView::new_default(img.clone()).unwrap()
 }
 
@@ -723,7 +782,11 @@ impl App {
             let set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
                 rcx.mrt_pass.gbuffer_pipeline.layout().set_layouts()[1].clone(),
-                [],
+                [WriteDescriptorSet::image_view_sampler(
+                    0,
+                    rcx.white_image_sampler.clone(),
+                    rcx.default_sampler.clone(),
+                )],
                 [],
             )
             .unwrap();
@@ -733,12 +796,13 @@ impl App {
                     .for_frame(rcx.frame_index)
                     .clone(),
                 set,
-            ];
+            ]
+            .to_vec();
 
             builder
                 .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent.clone(),
-                    render_area_offset: rcx.scissor.offset.clone(),
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
                     color_attachments: vec![
                         Some(RenderingAttachmentInfo {
                             load_op: AttachmentLoadOp::Clear,
@@ -778,7 +842,7 @@ impl App {
                 .unwrap()
                 .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
                 .unwrap()
-                .set_scissor(0, [rcx.scissor.clone()].into_iter().collect())
+                .set_scissor(0, [rcx.scissor].into_iter().collect())
                 .unwrap()
                 .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_pipeline.clone())
                 .unwrap()
@@ -812,8 +876,8 @@ impl App {
 
             builder
                 .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent.clone(),
-                    render_area_offset: rcx.scissor.offset.clone(),
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
                     color_attachments: vec![Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
@@ -856,8 +920,8 @@ impl App {
 
             builder
                 .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent.clone(),
-                    render_area_offset: rcx.scissor.offset.clone(),
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
                     color_attachments: vec![Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
@@ -890,8 +954,8 @@ impl App {
 
             builder
                 .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent.clone(),
-                    render_area_offset: rcx.scissor.offset.clone(),
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
                     color_attachments: vec![Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
@@ -1389,7 +1453,7 @@ fn window_size_dependent_setup(
     // === Bloom PASS (From HDR → another HDR)
     // ==============================================================
     let bloom_pass =
-        BloomPass::new(&device, &memory_allocator, window_size[0], window_size[1]).unwrap();
+        BloomPass::new(device, memory_allocator, window_size[0], window_size[1]).unwrap();
 
     // ==============================================================
     // === COMPOSITE PASS (From HDR → another HDR)

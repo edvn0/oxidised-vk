@@ -79,11 +79,11 @@ impl InputState {
 
     pub fn apply_cursor_mode(&self, window: &Window) {
         if self.rotating {
-            let _ = window.set_cursor_visible(false);
-            let _ = window.set_cursor_grab(CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
+            window.set_cursor_grab(CursorGrabMode::Locked).unwrap();
         } else {
-            let _ = window.set_cursor_visible(true);
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+            window.set_cursor_grab(CursorGrabMode::None).unwrap();
         }
     }
 }

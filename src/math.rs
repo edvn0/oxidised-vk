@@ -14,7 +14,7 @@ pub fn perspective(
     let x = focal_length / aspect_ratio;
     let y = -focal_length;
 
-    let projection = match f {
+    match f {
         Some(far) => {
             // Standard finite projection
             let a = n / (far - n);
@@ -78,7 +78,5 @@ pub fn perspective(
 
             p
         }
-    };
-
-    projection
+    }
 }
