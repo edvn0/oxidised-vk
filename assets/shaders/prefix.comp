@@ -1,0 +1,57 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set=0, binding=0, std430) readonly buffer VisIn {
+    uint vis[];
+};
+
+struct IndirectCmd {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+layout(set=0, binding=1, std430) buffer IndirectOut {
+    IndirectCmd cmds[];
+};
+
+layout(push_constant) uniform Push {
+    uint mesh_count;
+};
+
+layout(set=0, binding=2, std430) readonly buffer MeshOffsets {
+    uint offsets[];  // length = mesh_count+1
+};
+
+shared uint prefix_local[256];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    uint v = vis[gid];
+    prefix_local[lid] = v;
+    memoryBarrierShared();
+    barrier();
+
+    for(uint off = 1; off < gl_WorkGroupSize.x; off <<= 1) {
+        uint p = (lid >= off) ? prefix_local[lid - off] : 0;
+        barrier();
+        prefix_local[lid] += p;
+        barrier();
+    }
+
+    if (v == 1) {
+        for (uint m = 0; m < mesh_count; ++m) {
+            uint base = offsets[m];
+            uint next = offsets[m + 1];
+
+            if (gid >= base && gid < next) {
+                atomicAdd(cmds[m].instance_count, 1);
+                return;
+            }
+        }
+    }
+}

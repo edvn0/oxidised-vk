@@ -4,19 +4,21 @@ mod input_state;
 mod main_helpers;
 mod math;
 mod shader_bindings;
+mod culling;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
-use nalgebra::{Matrix4, Rotation3, Vector3};
+use nalgebra::{Matrix4, Rotation3, Translation3, Vector3};
 use std::collections::BTreeMap;
 use std::default::Default;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use vulkano::command_buffer::{ClearColorImageInfo, PrimaryCommandBufferAbstract};
-use vulkano::descriptor_set::layout::DescriptorType::CombinedImageSampler;
+use rand::Rng;
+use vulkano::command_buffer::{ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract};
+use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
@@ -73,6 +75,8 @@ use vulkano::{
     },
     sync::{self, GpuFuture},
 };
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
+use vulkano::pipeline::ComputePipeline;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
 use winit::{
@@ -82,6 +86,7 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+use crate::culling::{construct_culling_passes, CullPass, PrefixPass};
 
 extern crate nalgebra_glm as glm;
 
@@ -101,7 +106,8 @@ struct PushConsts {
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
-    queue: Arc<Queue>,
+    graphics_queue: Arc<Queue>,
+    compute_queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
@@ -114,9 +120,11 @@ struct App {
     last_frame: Instant,
 }
 struct MRT {
+    predepth_pipeline: Arc<GraphicsPipeline>,
     gbuffer_image_views: [Arc<ImageView>; 3],
     gbuffer_depth_view: Arc<ImageView>,
     gbuffer_pipeline: Arc<GraphicsPipeline>,
+    gbuffer_instanced_pipeline: Arc<GraphicsPipeline>,
 }
 
 struct SwapchainPass {
@@ -138,9 +146,15 @@ struct Composite {
 }
 
 #[repr(C)]
-#[derive(BufferContents)]
+#[derive(BufferContents, Copy, Clone)]
 pub struct TransformTRS {
     pub trs: [f32; 16],
+}
+
+#[repr(C)]
+#[derive(BufferContents, Clone, Copy)]
+pub struct FrustumPlanes {
+    pub planes: [[f32; 4]; 6],
 }
 
 struct RenderContext {
@@ -148,25 +162,30 @@ struct RenderContext {
     swapchain: Arc<Swapchain>,
     viewport: Viewport,
     scissor: Scissor,
-    frame_index: usize,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     default_sampler: Arc<Sampler>,
     start_time: Instant,
     elapsed_millis: u64,
 
-    frame_transforms: Vec<Subbuffer<TransformTRS>>, // TODO: Move
+    frame_transforms: Vec<Subbuffer<[TransformTRS]>>, // TODO: Move
+    indirect_buffers: Vec<Subbuffer<[DrawIndexedIndirectCommand]>>,
+    visibility_buffers: Vec<Subbuffer<[u32]>>,
+    mesh_offsets_buffers: Vec<Subbuffer<[u32]>>,
     white_image_sampler: Arc<ImageView>,
     black_image_sampler: Arc<ImageView>,
 
     context_descriptor_set: FrameDescriptorSet,
     frame_uniform_buffers: Vec<Subbuffer<RendererUBO>>,
+    frustum_buffers: Vec<Subbuffer<FrustumPlanes>>,
 
     mrt_pass: MRT,
     mrt_lighting: MRTLighting,
     composite: Composite,
     swapchain_pass: SwapchainPass,
     bloom_pass: BloomPass,
+    cull_pass: CullPass,
+    prefix_pass: PrefixPass
 }
 
 impl RenderContext {
@@ -217,63 +236,74 @@ impl App {
             ..DeviceExtensions::empty()
         };
 
-        let (physical_device, queue_family_index) = instance
-            .enumerate_physical_devices()
-            .unwrap()
-            .filter(|p| {
-                p.api_version() >= Version::V1_4 || p.supported_extensions().khr_dynamic_rendering
-            })
-            .filter(|p| p.supported_extensions().contains(&device_extensions))
-            .filter_map(|p| {
-                p.queue_family_properties()
-                    .iter()
-                    .enumerate()
-                    .position(|(i, q)| {
-                        q.queue_flags.intersects(QueueFlags::GRAPHICS)
-                            && p.presentation_support(i as u32, event_loop).unwrap()
-                    })
-                    .map(|i| (p, i as u32))
-            })
-            .min_by_key(|(p, _)| match p.properties().device_type {
-                PhysicalDeviceType::DiscreteGpu => 0,
-                PhysicalDeviceType::IntegratedGpu => 1,
-                PhysicalDeviceType::VirtualGpu => 2,
-                PhysicalDeviceType::Cpu => 3,
-                PhysicalDeviceType::Other => 4,
-                _ => 5,
-            })
-            .expect("no suitable physical device found");
+        let (physical_device, graphics_index, compute_index) = {
+            let mut best = None;
+            for p in instance.enumerate_physical_devices().unwrap() {
+                if !(p.api_version() >= Version::V1_4 || p.supported_extensions().khr_dynamic_rendering) {
+                    continue;
+                }
+                if !p.supported_extensions().contains(&device_extensions) {
+                    continue;
+                }
 
-        println!(
-            "Using device: {} (type: {:?})",
-            physical_device.properties().device_name,
-            physical_device.properties().device_type,
-        );
+                let mut gq = None;
+                let mut cq = None;
 
-        if physical_device.api_version() < Version::V1_3 {
-            device_extensions.khr_dynamic_rendering = true;
+                for (i, q) in p.queue_family_properties().iter().enumerate() {
+                    if gq.is_none()
+                        && q.queue_flags.intersects(QueueFlags::GRAPHICS)
+                        && p.presentation_support(i as u32, event_loop).unwrap()
+                    {
+                        gq = Some(i as u32);
+                    }
+                    if cq.is_none() && q.queue_flags.intersects(QueueFlags::COMPUTE) {
+                        cq = Some(i as u32);
+                    }
+                }
+
+                let g = match gq { Some(v) => v, None => continue };
+                let c = cq.unwrap_or(g);
+
+                let score = match p.properties().device_type {
+                    PhysicalDeviceType::DiscreteGpu => 0,
+                    PhysicalDeviceType::IntegratedGpu => 1,
+                    PhysicalDeviceType::VirtualGpu => 2,
+                    PhysicalDeviceType::Cpu => 3,
+                    _ => 4,
+                };
+
+                match best {
+                    None => best = Some((p, g, c, score)),
+                    Some((_, _, _, s)) if score < s => best = Some((p, g, c, score)),
+                    _ => {}
+                }
+            }
+            let (p, g, c, _) = best.expect("no suitable device found");
+            (p, g, c)
+        };
+
+        let mut infos = Vec::new();
+        infos.push(QueueCreateInfo { queue_family_index: graphics_index, ..Default::default() });
+        if compute_index != graphics_index {
+            infos.push(QueueCreateInfo { queue_family_index: compute_index, ..Default::default() });
         }
 
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
-                queue_create_infos: [QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }]
-                .to_vec(),
+                queue_create_infos: infos,
                 enabled_extensions: device_extensions,
-                enabled_features: DeviceFeatures {
-                    dynamic_rendering: true,
-                    ..DeviceFeatures::empty()
-                },
-
+                enabled_features: DeviceFeatures { dynamic_rendering: true, ..DeviceFeatures::empty() },
                 ..Default::default()
             },
-        )
-        .unwrap();
+        ).unwrap();
 
-        let queue = queues.next().unwrap();
+        let graphics_queue = queues.next().unwrap();
+        let compute_queue = if compute_index != graphics_index {
+            queues.next().unwrap()
+        } else {
+            graphics_queue.clone()
+        };
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
@@ -365,7 +395,8 @@ impl App {
         Ok(App {
             instance,
             device,
-            queue,
+            graphics_queue,
+            compute_queue,
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
@@ -377,6 +408,34 @@ impl App {
             rcx: None,
         })
     }
+}
+
+fn generate_random_transforms(count: usize) -> Vec<TransformTRS> {
+    let mut rng = rand::rng();
+    let mut transforms = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let x = rng.random_range(-50.0..50.0);
+        let y = rng.random_range(-50.0..50.0);
+        let z = rng.random_range(-50.0..50.0);
+        let translation = Translation3::new(x, y, z);
+
+        let rx = rng.random_range(0.0..std::f32::consts::TAU);
+        let ry = rng.random_range(0.0..std::f32::consts::TAU);
+        let rz = rng.random_range(0.0..std::f32::consts::TAU);
+        let rotation = nalgebra::Rotation3::from_euler_angles(rx, ry, rz);
+
+        let scale = rng.random_range(0.1..0.5);
+        let scale_matrix = Matrix4::new_scaling(scale);
+
+        let transform = translation.to_homogeneous() * rotation.to_homogeneous() * scale_matrix;
+
+        transforms.push(TransformTRS {
+            trs: transform.as_slice().try_into().unwrap(),
+        });
+    }
+
+    transforms
 }
 
 impl ApplicationHandler for App {
@@ -450,7 +509,7 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
+        let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull, prefix) =
             window_size_dependent_setup(
                 &self.device,
                 &self.memory_allocator,
@@ -493,9 +552,26 @@ impl ApplicationHandler for App {
             })
             .collect::<Vec<Subbuffer<RendererUBO>>>();
 
+        let frustum_ubos = (0..image_count)
+            .map(|_| {
+                Buffer::new_sized::<FrustumPlanes>(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                ).unwrap()
+            })
+            .collect::<Vec<Subbuffer<FrustumPlanes>>>();
+
         let ssbos = (0..image_count)
             .map(|_| {
-                Buffer::new_unsized::<TransformTRS>(
+                Buffer::new_slice::<TransformTRS>(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
                         usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
@@ -510,7 +586,56 @@ impl ApplicationHandler for App {
                 )
                 .unwrap()
             })
-            .collect::<Vec<Subbuffer<TransformTRS>>>();
+            .collect::<Vec<Subbuffer<[TransformTRS]>>>();
+
+        let indirect_buffers = (0..image_count)
+            .map(|_| {
+                Buffer::new_slice::<DrawIndexedIndirectCommand>(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    1
+                ).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let visibility_buffers: Vec<_> = (0..image_count)
+            .map(|_| {
+                Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::STORAGE_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        ..Default::default()
+                    },
+                    std::iter::repeat(0u32).take(10_000),
+                ).unwrap()
+            }).collect();
+
+        let mesh_offsets_buffers: Vec<_> = (0..image_count)
+            .map(|_| {
+                Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::STORAGE_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        ..Default::default()
+                    },
+                    [0u32, 10_000u32],
+                ).unwrap()
+            }).collect();
 
         let _shadow_map_sampler = Sampler::new(
             self.device.clone(),
@@ -532,6 +657,15 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
+        let random_transforms = generate_random_transforms(100_000);
+
+        for ssbo in ssbos.iter() {
+            if let Ok(mut write) = ssbo.write() {
+                let len = write.len().min(random_transforms.len());
+                write[..len].copy_from_slice(&random_transforms[..len]);
+            }
+        }
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -539,7 +673,6 @@ impl ApplicationHandler for App {
             viewport,
             scissor,
             recreate_swapchain,
-            frame_index: 0,
             previous_frame_end,
             start_time: Instant::now(),
             elapsed_millis: 0,
@@ -550,23 +683,29 @@ impl ApplicationHandler for App {
             ),
             default_sampler,
             frame_transforms: ssbos,
+            indirect_buffers,
+            visibility_buffers,
+            mesh_offsets_buffers,
             white_image_sampler: create_image(
-                &self.queue,
+                &self.graphics_queue,
                 &self.command_buffer_allocator,
                 &self.memory_allocator,
                 0xFF,
             ),
             black_image_sampler: create_image(
-                &self.queue,
+                &self.graphics_queue,
                 &self.command_buffer_allocator,
                 &self.memory_allocator,
                 0x00,
             ),
             frame_uniform_buffers: uniform_buffers,
+            frustum_buffers: frustum_ubos,
             mrt_pass: mrt,
             mrt_lighting,
             composite,
             bloom_pass,
+            cull_pass: cull,
+            prefix_pass: prefix,
         });
     }
 
@@ -647,11 +786,7 @@ fn create_image(
             initial_layout: vulkano::image::ImageLayout::Undefined,
             ..Default::default()
         },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+        Default::default(),
     )
     .unwrap();
 
@@ -717,7 +852,7 @@ impl App {
 
             rcx.swapchain = new_swapchain;
 
-            let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
+            let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull, prefix) =
                 window_size_dependent_setup(
                     &self.device,
                     &self.memory_allocator,
@@ -730,6 +865,8 @@ impl App {
             rcx.mrt_lighting = mrt_lighting;
             rcx.composite = composite;
             rcx.bloom_pass = bloom_pass;
+            rcx.cull_pass= cull;
+            rcx.prefix_pass= prefix;
 
             rcx.viewport.extent = [window_size.width as f32, window_size.height as f32];
             rcx.scissor.extent = window_size.into();
@@ -751,9 +888,69 @@ impl App {
             rcx.recreate_swapchain = true;
         }
 
+        {
+            let ib = &rcx.indirect_buffers[image_index as usize];
+            if let Ok(mut d) = ib.write() {
+                for k in d.iter_mut() {
+                    k.index_count = self.index_buffer.len() as u32;
+                    k.instance_count = 0;
+                    k.first_index = 0;
+                    k.vertex_offset = 0;
+                    k.first_instance = 0;
+                }
+            }
+        }
+
+
+        {
+            let view = self.camera.view_matrix();
+            let proj = self.camera.projection_matrix(
+                rcx.window.inner_size().width as f32
+                    / rcx.window.inner_size().height as f32
+            );
+            let vp = proj * view;
+
+            let mut planes = [[0f32; 4]; 6];
+
+            let m = vp.as_slice();
+
+            fn extract_plane(m: &[f32], a: usize, sign: f32) -> [f32; 4] {
+                [
+                    m[12] + sign * m[a + 0], // Nx
+                    m[13] + sign * m[a + 4], // Ny
+                    m[14] + sign * m[a + 8], // Nz
+                    m[15] + sign * m[a + 12] // D
+                ]
+            }
+
+            planes[0] = extract_plane(m, 0,  1.0); // Left
+            planes[1] = extract_plane(m, 0, -1.0); // Right
+            planes[2] = extract_plane(m, 1,  1.0); // Bottom
+            planes[3] = extract_plane(m, 1, -1.0); // Top
+            planes[4] = extract_plane(m, 2,  1.0); // Near
+            planes[5] = extract_plane(m, 2, -1.0); // Far
+
+            fn normalize_plane(p: &mut [f32; 4]) {
+                let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
+                p[0] /= len;
+                p[1] /= len;
+                p[2] /= len;
+                p[3] /= len;
+            }
+
+            for p in planes.iter_mut() {
+                normalize_plane(p);
+            }
+
+            if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
+                w.planes = planes;
+            }
+        }
+
+
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
-            self.queue.queue_family_index(),
+            self.graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
@@ -765,39 +962,125 @@ impl App {
             rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
         }
 
+        let culling_future = {
+            let transforms = rcx.frame_transforms[image_index as usize].clone();
+            let mesh_count = 1;
+
+            let visibility = rcx.visibility_buffers[image_index as usize].clone();
+            if let Ok(mut v) = visibility.write() {
+                for x in v.iter_mut() { *x = 0; }
+            }
+            let mesh_offsets = rcx.mesh_offsets_buffers[image_index as usize].clone();
+
+            // Pass 1: Culling
+            let fut_cull = rcx.cull_pass.execute(
+                &self.command_buffer_allocator,
+                &self.compute_queue,
+                &self.descriptor_set_allocator,
+                transforms.clone(),
+                visibility.clone(),
+                rcx.frustum_buffers[image_index as usize].clone(),
+            );
+
+            // Pass 2: Prefix sum + indirect write
+            let fut_prefix = rcx.prefix_pass.execute(
+                &self.command_buffer_allocator,
+                &self.compute_queue,
+                &self.descriptor_set_allocator,
+                visibility.clone(),
+                rcx.indirect_buffers[image_index as usize].clone(),
+                mesh_offsets.clone(),
+                mesh_count,
+            );
+
+            fut_cull.join(fut_prefix)
+                .then_signal_semaphore_and_flush()
+                .unwrap()
+        };
+
         {
-            // Pass 1: Build MRT with geometry
-            let t = rcx.elapsed_millis as f32 / 1000.0;
+            // Pre-Depth instanced pass
+            let set = DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                rcx.mrt_pass.predepth_pipeline.layout().set_layouts()[1].clone(),
+                [WriteDescriptorSet::buffer(
+                    1,
+                    rcx.frame_transforms[image_index as usize].clone(),
+                )],
+                [],
+            ).unwrap();
 
-            let rot_y = Rotation3::from_axis_angle(&Vector3::y_axis(), t);
-            let rot_x = Rotation3::from_axis_angle(&Vector3::x_axis(), t * 0.4);
-            let rotation = (rot_y * rot_x).to_homogeneous();
+            let sets = [
+                rcx.context_descriptor_set.for_frame(image_index as usize).clone(),
+                set,
+            ];
 
-            let model = rotation * Matrix4::<f32>::new_scaling(0.8);
+            builder
+                .begin_rendering(RenderingInfo {
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
+                    color_attachments: vec![], // No MRT!
+                    depth_attachment: Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Clear,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_value: Some(ClearValue::Depth(0.0)),
+                        ..RenderingAttachmentInfo::image_view(
+                            rcx.mrt_pass.gbuffer_depth_view.clone(),
+                        )
+                    }),
+                    ..Default::default()
+                }).unwrap()
+                .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
+                .unwrap()
+                .set_scissor(0, [rcx.scissor].into_iter().collect())
+                .unwrap()
+                .bind_pipeline_graphics(rcx.mrt_pass.predepth_pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    rcx.mrt_pass.predepth_pipeline.layout().clone(),
+                    0,
+                    sets.to_vec(),
+                )
+                .unwrap()
+                .bind_vertex_buffers(0, self.vertex_buffer.clone())
+                .unwrap()
+                .bind_index_buffer(self.index_buffer.clone())
+                .unwrap();
 
-            let pc = PushConsts {
-                model: model.as_slice().try_into().unwrap(),
-            };
+            unsafe {
+                builder.draw_indexed_indirect(
+                    rcx.indirect_buffers[image_index as usize].clone(),
+                ).unwrap();
+            }
+            builder.end_rendering().unwrap();
+        }
+
+        {
+            // Pass 1: MRT with instanced geometry
 
             let set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
-                rcx.mrt_pass.gbuffer_pipeline.layout().set_layouts()[1].clone(),
+                rcx.mrt_pass.gbuffer_instanced_pipeline.layout().set_layouts()[1].clone(),
                 [WriteDescriptorSet::image_view_sampler(
                     0,
                     rcx.white_image_sampler.clone(),
                     rcx.default_sampler.clone(),
-                )],
+                ),
+                    WriteDescriptorSet::buffer(
+                        1,
+                        rcx.frame_transforms[image_index as usize].clone(),
+                    )],
                 [],
             )
-            .unwrap();
+                .unwrap();
 
             let sets = [
                 rcx.context_descriptor_set
-                    .for_frame(rcx.frame_index)
+                    .for_frame(image_index as usize)
                     .clone(),
                 set,
-            ]
-            .to_vec();
+            ];
 
             builder
                 .begin_rendering(RenderingInfo {
@@ -830,9 +1113,9 @@ impl App {
                         }),
                     ],
                     depth_attachment: Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
+                        load_op: AttachmentLoadOp::Load,
                         store_op: AttachmentStoreOp::Store,
-                        clear_value: Some(ClearValue::Depth(0.0)),
+                        clear_value: None,
                         ..RenderingAttachmentInfo::image_view(
                             rcx.mrt_pass.gbuffer_depth_view.clone(),
                         )
@@ -844,24 +1127,25 @@ impl App {
                 .unwrap()
                 .set_scissor(0, [rcx.scissor].into_iter().collect())
                 .unwrap()
-                .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_pipeline.clone())
+                .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_instanced_pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
-                    rcx.mrt_pass.gbuffer_pipeline.layout().clone(),
+                    rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
                     0,
-                    sets,
+                    sets.to_vec(),
                 )
-                .unwrap()
-                .push_constants(rcx.mrt_pass.gbuffer_pipeline.layout().clone(), 0, pc)
                 .unwrap()
                 .bind_vertex_buffers(0, self.vertex_buffer.clone())
                 .unwrap()
                 .bind_index_buffer(self.index_buffer.clone())
                 .unwrap();
 
-            unsafe { builder.draw_indexed(self.index_buffer.len() as u32, 1, 0, 0, 0) }.unwrap();
-
+            unsafe {
+                builder.draw_indexed_indirect(
+                    rcx.indirect_buffers[image_index as usize].clone(),
+                ).unwrap();
+            }
             builder.end_rendering().unwrap();
         }
 
@@ -869,7 +1153,7 @@ impl App {
             // Pass 2: MRT Lighting
             let descriptor_sets = vec![
                 rcx.context_descriptor_set
-                    .for_frame(rcx.frame_index)
+                    .for_frame(image_index as usize)
                     .clone(),
                 rcx.mrt_lighting.set.clone(),
             ];
@@ -988,10 +1272,11 @@ impl App {
             .take()
             .unwrap()
             .join(acquire_future)
-            .then_execute(self.queue.clone(), command_buffer)
+            .join(culling_future)
+            .then_execute(self.graphics_queue.clone(), command_buffer)
             .unwrap()
             .then_swapchain_present(
-                self.queue.clone(),
+                self.graphics_queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
             )
             .then_signal_fence_and_flush();
@@ -1009,9 +1294,6 @@ impl App {
                 rcx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
         }
-
-        let count = rcx.swapchain.image_count() as usize;
-        rcx.frame_index = (rcx.frame_index + 1) % count;
 
         self.input_state.end_frame();
     }
@@ -1034,7 +1316,103 @@ fn window_size_dependent_setup(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     default_sampler: &Arc<Sampler>,
     swapchain_images: &[Arc<Image>],
-) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
+) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass, CullPass, PrefixPass) {
+    let predepth_pipeline = {
+        mod vs {
+            vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                #version 450
+                layout(location = 0) in vec3 position;
+
+                layout(set=0, binding=0, std140) uniform UBO {
+                    mat4 view;
+                    mat4 projection;
+                    mat4 inverse_projection;
+                    vec4 sun_direction;
+                };
+
+                struct Transform { mat4 t; };
+                layout(set = 1, binding = 1, std140) readonly buffer SSBO {
+                    Transform transforms[];
+                };
+
+                void main() {
+                    int index = gl_InstanceIndex;
+                    mat4 model = transforms[index].t;
+
+                    vec4 world_pos = model * vec4(position,1.0);
+                    gl_Position = projection * (view * world_pos);
+                }
+            "
+        }
+        }
+
+        mod fs {
+            vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                #version 450
+                void main() { }
+            "
+        }
+        }
+
+        let vs = vs::load(device.clone()).unwrap().entry_point("main").unwrap();
+        let fs = fs::load(device.clone()).unwrap().entry_point("main").unwrap();
+
+        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let subpass = PipelineRenderingCreateInfo {
+            depth_attachment_format: Some(Format::D24_UNORM_S8_UINT),
+            ..Default::default()
+        };
+
+        let layout = {
+            let mut set_layouts = renderer_set_0_layouts();
+            // Keep instancing same as MRT
+            let mut inst = DescriptorSetLayoutCreateInfo::default();
+            inst.bindings.insert(1, {
+                let mut b = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
+                b.stages = ShaderStages::VERTEX;
+                b
+            });
+            set_layouts.push(inst);
+            PipelineLayout::new(
+                device.clone(),
+                PipelineDescriptorSetLayoutCreateInfo {
+                    flags: Default::default(),
+                    set_layouts,
+                    push_constant_ranges: vec![],
+                }
+                    .into_pipeline_layout_create_info(device.clone()).unwrap(),
+            )
+                .unwrap()
+        };
+
+        let mut ci = GraphicsPipelineCreateInfo::layout(layout);
+        ci.vertex_input_state = Some(vertex_input_state);
+        ci.input_assembly_state = Some(InputAssemblyState::default());
+        ci.viewport_state = Some(ViewportState::default());
+        ci.rasterization_state = Some(RasterizationState::default());
+        ci.multisample_state = Some(MultisampleState::default());
+        ci.depth_stencil_state = Some(DepthStencilState {
+            depth: Some(DepthState::reverse()), // Important
+            ..Default::default()
+        });
+        ci.subpass = Some(subpass.into());
+        ci.stages = stages.into_iter().collect();
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+
+        GraphicsPipeline::new(device.clone(), None, ci).unwrap()
+    };
+
     // ==============================================================
     // === MRT GEOMETRY PASS (Unmodified from your version)
     // ==============================================================
@@ -1154,7 +1532,7 @@ fn window_size_dependent_setup(
                     .into_pipeline_layout_create_info(device.clone())
                     .unwrap(),
             )
-            .unwrap()
+                .unwrap()
         };
 
         let mut ci = GraphicsPipelineCreateInfo::layout(layout);
@@ -1173,7 +1551,158 @@ fn window_size_dependent_setup(
         ci.multisample_state = Some(MultisampleState::default());
         ci.subpass = Some(subpass.into());
         ci.depth_stencil_state = Some(DepthStencilState {
-            depth: Some(DepthState::reverse()),
+            depth: Some(DepthState { write_enable: false, compare_op: CompareOp::Equal }),
+            ..Default::default()
+        });
+        ci.stages = stages.into_iter().collect();
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+
+        GraphicsPipeline::new(device.clone(), None, ci).unwrap()
+    };
+    let mrt_instanced_pipeline = {
+        mod vs {
+            vulkano_shaders::shader! {
+                ty: "vertex",
+                src: r"
+                    #version 450
+
+                    layout(location = 0) in vec3 position;
+                    layout(location = 1) in vec2 uvs;
+                    layout(location = 2) in vec3 normal;
+
+                    layout(location = 0) out vec3 v_normal;
+                    layout(location = 1) out vec2 v_uvs;
+
+                    layout(set=0, binding=0, std140) uniform UBO {
+                        mat4 view;
+                        mat4 projection;
+                        mat4 inverse_projection;
+                        vec4 sun_direction;
+                    };
+
+                    struct Transform {
+                        mat4 t;
+                    };
+                    layout(set = 1, binding = 1, std140) readonly buffer SSBO {
+                        Transform transforms[];
+                    };
+
+                    void main() {
+                        int index = gl_InstanceIndex;
+
+                        mat4 model = transforms[index].t;
+                        mat3 normal_mat = transpose(inverse(mat3(model)));
+                        vec3 world_norm = normalize(normal_mat * normal);
+
+                        vec4 world_pos = model * vec4(position,1.0);
+                        vec4 view_pos = view * world_pos;
+
+                        v_normal = normalize((view * vec4(world_norm,0.0)).xyz);
+                        v_uvs = uvs;
+
+                        gl_Position = projection * view_pos;
+                    }
+                ",
+            }
+        }
+
+        mod fs {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                src: r"
+                    #version 450
+
+                    layout(location = 0) in vec3 v_normal;
+                    layout(location = 1) in vec2 v_uvs;
+
+                    layout(location = 0) out vec4 normal_mrt;
+                    layout(location = 1) out vec4 uvs_mrt;
+                    layout(location = 2) out vec4 albedo_mrt;
+
+                    layout (set = 1, binding = 0) uniform sampler2D albedo_tex;
+
+                    void main() {
+                        normal_mrt = vec4(normalize(v_normal), 0.0);
+                        uvs_mrt = vec4(v_uvs, 0.0, 0.0);
+                        albedo_mrt = texture(albedo_tex, v_uvs);
+                    }
+                ",
+            }
+        }
+
+        let vs = vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+
+        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let subpass = PipelineRenderingCreateInfo {
+            color_attachment_formats: vec![
+                Some(Format::R16G16B16A16_SFLOAT),
+                Some(Format::R16G16B16A16_SFLOAT),
+                Some(Format::R16G16B16A16_SFLOAT),
+            ],
+            depth_attachment_format: Some(Format::D24_UNORM_S8_UINT),
+            ..Default::default()
+        };
+
+        let layout = {
+            let mut set_layout_1 = DescriptorSetLayoutCreateInfo::default();
+            let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+            bind.stages = ShaderStages::FRAGMENT;
+            set_layout_1.bindings.insert(0, bind);
+
+            let mut bind_ssbo = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
+            bind_ssbo.stages = ShaderStages::VERTEX;
+            set_layout_1.bindings.insert(1, bind_ssbo);
+
+            let mut set_layouts = renderer_set_0_layouts();
+            set_layouts.push(set_layout_1);
+            let infos = PipelineDescriptorSetLayoutCreateInfo {
+                flags: Default::default(),
+                set_layouts,
+                push_constant_ranges: vec![],
+            };
+            PipelineLayout::new(
+                device.clone(),
+                infos
+                    .into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
+            )
+                .unwrap()
+        };
+
+        let mut ci = GraphicsPipelineCreateInfo::layout(layout);
+        ci.vertex_input_state = Some(vertex_input_state);
+        ci.input_assembly_state = Some(InputAssemblyState::default());
+        ci.viewport_state = Some(ViewportState::default());
+        ci.rasterization_state = Some(RasterizationState::default());
+        ci.color_blend_state = Some(ColorBlendState {
+            attachments: vec![
+                ColorBlendAttachmentState::default(),
+                ColorBlendAttachmentState::default(),
+                ColorBlendAttachmentState::default(),
+            ],
+            ..Default::default()
+        });
+        ci.multisample_state = Some(MultisampleState::default());
+        ci.subpass = Some(subpass.into());
+        ci.depth_stencil_state = Some(DepthStencilState {
+            depth: Some(DepthState {
+                write_enable: false,
+                compare_op: CompareOp::Equal, // ← because pre-depth already wrote it
+            }),
             ..Default::default()
         });
         ci.stages = stages.into_iter().collect();
@@ -1244,7 +1773,9 @@ fn window_size_dependent_setup(
     };
 
     let mrt = MRT {
+        predepth_pipeline,
         gbuffer_pipeline: mrt_pipeline,
+        gbuffer_instanced_pipeline: mrt_instanced_pipeline,
         gbuffer_depth_view: to_view(depth_image.clone()),
         gbuffer_image_views: gbuffer_images
             .iter()
@@ -1316,7 +1847,7 @@ fn window_size_dependent_setup(
                             vec3 L = normalize(ubo.sun_direction.xyz);
                             float ndotl = max(dot(N,L), 0.0);
 
-                            vec3 albedo = texture(albedo_tex, v_uvs).xyz;
+                            vec3 albedo = vec3(0.8, 0.9, 0.1) * texture(albedo_tex, v_uvs).xyz;
 
                             out_hdr = vec4(albedo * ndotl, 1.0);
                         }
@@ -1753,5 +2284,7 @@ fn window_size_dependent_setup(
         pass
     };
 
-    (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass)
+    let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device, &descriptor_set_allocator);
+
+    (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull_compute_pass, cull_prefix_pass)
 }
