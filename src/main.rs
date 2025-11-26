@@ -1,23 +1,26 @@
 mod bloom_pass;
 mod camera;
+mod culling;
 mod input_state;
 mod main_helpers;
 mod math;
 mod shader_bindings;
-mod culling;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
+use crate::culling::{CullPass, PrefixPass, construct_culling_passes};
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use nalgebra::{Matrix4, Rotation3, Translation3, Vector3};
+use rand::Rng;
 use std::collections::BTreeMap;
 use std::default::Default;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use rand::Rng;
-use vulkano::command_buffer::{ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract};
+use vulkano::command_buffer::{
+    ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
+};
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
@@ -27,6 +30,8 @@ use vulkano::image::sampler::{
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{ImageAspects, ImageSubresourceRange, SampleCount};
 use vulkano::instance::InstanceExtensions;
+use vulkano::pipeline::ComputePipeline;
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
@@ -75,8 +80,6 @@ use vulkano::{
     },
     sync::{self, GpuFuture},
 };
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::ComputePipeline;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
 use winit::{
@@ -86,7 +89,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use crate::culling::{construct_culling_passes, CullPass, PrefixPass};
 
 extern crate nalgebra_glm as glm;
 
@@ -185,7 +187,7 @@ struct RenderContext {
     swapchain_pass: SwapchainPass,
     bloom_pass: BloomPass,
     cull_pass: CullPass,
-    prefix_pass: PrefixPass
+    prefix_pass: PrefixPass,
 }
 
 impl RenderContext {
@@ -239,7 +241,9 @@ impl App {
         let (physical_device, graphics_index, compute_index) = {
             let mut best = None;
             for p in instance.enumerate_physical_devices().unwrap() {
-                if !(p.api_version() >= Version::V1_4 || p.supported_extensions().khr_dynamic_rendering) {
+                if !(p.api_version() >= Version::V1_4
+                    || p.supported_extensions().khr_dynamic_rendering)
+                {
                     continue;
                 }
                 if !p.supported_extensions().contains(&device_extensions) {
@@ -261,7 +265,10 @@ impl App {
                     }
                 }
 
-                let g = match gq { Some(v) => v, None => continue };
+                let g = match gq {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let c = cq.unwrap_or(g);
 
                 let score = match p.properties().device_type {
@@ -283,9 +290,15 @@ impl App {
         };
 
         let mut infos = Vec::new();
-        infos.push(QueueCreateInfo { queue_family_index: graphics_index, ..Default::default() });
+        infos.push(QueueCreateInfo {
+            queue_family_index: graphics_index,
+            ..Default::default()
+        });
         if compute_index != graphics_index {
-            infos.push(QueueCreateInfo { queue_family_index: compute_index, ..Default::default() });
+            infos.push(QueueCreateInfo {
+                queue_family_index: compute_index,
+                ..Default::default()
+            });
         }
 
         let (device, mut queues) = Device::new(
@@ -293,10 +306,14 @@ impl App {
             DeviceCreateInfo {
                 queue_create_infos: infos,
                 enabled_extensions: device_extensions,
-                enabled_features: DeviceFeatures { dynamic_rendering: true, ..DeviceFeatures::empty() },
+                enabled_features: DeviceFeatures {
+                    dynamic_rendering: true,
+                    ..DeviceFeatures::empty()
+                },
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         let graphics_queue = queues.next().unwrap();
         let compute_queue = if compute_index != graphics_index {
@@ -361,6 +378,57 @@ impl App {
                 uvs: [ux, uy],
             });
         }
+
+        
+// Calculate actual mesh bounding sphere
+let mut min_x = f32::MAX;
+let mut max_x = f32::MIN;
+let mut min_y = f32::MAX;
+let mut max_y = f32::MIN;
+let mut min_z = f32::MAX;
+let mut max_z = f32::MIN;
+
+for i in 0..mesh.positions.len()/3 {
+    let x = mesh.positions[i * 3 + 0];
+    let y = mesh.positions[i * 3 + 1];
+    let z = mesh.positions[i * 3 + 2];
+    
+    min_x = min_x.min(x);
+    max_x = max_x.max(x);
+    min_y = min_y.min(y);
+    max_y = max_y.max(y);
+    min_z = min_z.min(z);
+    max_z = max_z.max(z);
+}
+
+let center = [
+    (min_x + max_x) / 2.0,
+    (min_y + max_y) / 2.0,
+    (min_z + max_z) / 2.0,
+];
+
+// Calculate radius as max distance from center
+let mut max_radius_sq = 0.0f32;
+for i in 0..mesh.positions.len()/3 {
+    let x = mesh.positions[i * 3 + 0] - center[0];
+    let y = mesh.positions[i * 3 + 1] - center[1];
+    let z = mesh.positions[i * 3 + 2] - center[2];
+    let dist_sq = x*x + y*y + z*z;
+    max_radius_sq = max_radius_sq.max(dist_sq);
+}
+
+let radius = max_radius_sq.sqrt();
+
+println!("\n=== MESH BOUNDS ===");
+println!("Bounding box:");
+println!("  X: {:.3} to {:.3}", min_x, max_x);
+println!("  Y: {:.3} to {:.3}", min_y, max_y);
+println!("  Z: {:.3} to {:.3}", min_z, max_z);
+println!("Center: ({:.3}, {:.3}, {:.3})", center[0], center[1], center[2]);
+println!("Bounding sphere radius: {:.3}", radius);
+println!("\n⚠️  UPDATE your cull.comp shader:");
+println!("    const float BASE_RADIUS = {:.3};", radius);
+println!("===================\n");
 
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
@@ -441,7 +509,7 @@ fn generate_random_transforms(count: usize) -> Vec<TransformTRS> {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attribs = Window::default_attributes();
-        attribs.inner_size = Some(PhysicalSize::new(1920, 1280).into());
+        attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
         let window = Arc::new(event_loop.create_window(attribs).unwrap());
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let window_size = window.inner_size();
@@ -565,7 +633,8 @@ impl ApplicationHandler for App {
                             | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                ).unwrap()
+                )
+                .unwrap()
             })
             .collect::<Vec<Subbuffer<FrustumPlanes>>>();
 
@@ -590,18 +659,29 @@ impl ApplicationHandler for App {
 
         let indirect_buffers = (0..image_count)
             .map(|_| {
-                Buffer::new_slice::<DrawIndexedIndirectCommand>(
+                Buffer::from_iter(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
                         usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    1
-                ).unwrap()
+                    vec![
+                        DrawIndexedIndirectCommand {
+                            index_count: 0,
+                            instance_count: 0,
+                            first_index: 0,
+                            vertex_offset: 0,
+                            first_instance: 0,
+                        };
+                        1
+                    ], // One command per mesh type
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
 
@@ -614,12 +694,15 @@ impl ApplicationHandler for App {
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                         ..Default::default()
                     },
                     std::iter::repeat(0u32).take(10_000),
-                ).unwrap()
-            }).collect();
+                )
+                .unwrap()
+            })
+            .collect();
 
         let mesh_offsets_buffers: Vec<_> = (0..image_count)
             .map(|_| {
@@ -630,12 +713,15 @@ impl ApplicationHandler for App {
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                         ..Default::default()
                     },
                     [0u32, 10_000u32],
-                ).unwrap()
-            }).collect();
+                )
+                .unwrap()
+            })
+            .collect();
 
         let _shadow_map_sampler = Sampler::new(
             self.device.clone(),
@@ -865,8 +951,8 @@ impl App {
             rcx.mrt_lighting = mrt_lighting;
             rcx.composite = composite;
             rcx.bloom_pass = bloom_pass;
-            rcx.cull_pass= cull;
-            rcx.prefix_pass= prefix;
+            rcx.cull_pass = cull;
+            rcx.prefix_pass = prefix;
 
             rcx.viewport.extent = [window_size.width as f32, window_size.height as f32];
             rcx.scissor.extent = window_size.into();
@@ -888,6 +974,8 @@ impl App {
             rcx.recreate_swapchain = true;
         }
 
+        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
         {
             let ib = &rcx.indirect_buffers[image_index as usize];
             if let Ok(mut d) = ib.write() {
@@ -901,102 +989,315 @@ impl App {
             }
         }
 
+        // Replace your frustum calculation with this corrected version
 
-        {
-            let view = self.camera.view_matrix();
-            let proj = self.camera.projection_matrix(
-                rcx.window.inner_size().width as f32
-                    / rcx.window.inner_size().height as f32
-            );
-            let vp = proj * view;
+        // Replace your frustum calculation with this corrected version
 
-            let mut planes = [[0f32; 4]; 6];
+        // Replace your frustum calculation with this corrected version
 
-            let m = vp.as_slice();
+{
+    let view = self.camera.view_matrix();
+    let proj = self.camera.projection_matrix(
+        rcx.window.inner_size().width as f32
+            / rcx.window.inner_size().height as f32
+    );
+    let vp = proj * view;
 
-            fn extract_plane(m: &[f32], a: usize, sign: f32) -> [f32; 4] {
-                [
-                    m[12] + sign * m[a + 0], // Nx
-                    m[13] + sign * m[a + 4], // Ny
-                    m[14] + sign * m[a + 8], // Nz
-                    m[15] + sign * m[a + 12] // D
-                ]
+    let mut planes = [[0f32; 4]; 6];
+    let m = vp.as_slice();
+
+    // Standard plane extraction (works for all 6 planes with reverse-Z)
+    // Format: Plane equation is Nx*x + Ny*y + Nz*z + d = 0
+    // A point is inside if the result is >= 0 (with outward-facing normals)
+    
+    // Left plane: clip.w + clip.x >= 0
+    planes[0] = [
+        m[3] + m[0],
+        m[7] + m[4],
+        m[11] + m[8],
+        m[15] + m[12],
+    ];
+    
+    // Right plane: clip.w - clip.x >= 0
+    planes[1] = [
+        m[3] - m[0],
+        m[7] - m[4],
+        m[11] - m[8],
+        m[15] - m[12],
+    ];
+    
+    // Bottom plane: clip.w + clip.y >= 0
+    planes[2] = [
+        m[3] + m[1],
+        m[7] + m[5],
+        m[11] + m[9],
+        m[15] + m[13],
+    ];
+    
+    // Top plane: clip.w - clip.y >= 0
+    planes[3] = [
+        m[3] - m[1],
+        m[7] - m[5],
+        m[11] - m[9],
+        m[15] - m[13],
+    ];
+    
+    // For REVERSE-Z where near=1.0, far=0.0:
+    // In clip space: z/w goes from 1.0 (near) to 0.0 (far)
+    
+    // Near plane: clip.w - clip.z >= 0  (because z/w <= 1.0)
+    // This is: w - z >= 0, or equivalently: 1.0 - (z/w) >= 0
+    planes[4] = [
+        m[3] - m[2],
+        m[7] - m[6],
+        m[11] - m[10],
+        m[15] - m[14],
+    ];
+    
+    // Far plane: clip.z >= 0  (because z/w >= 0.0)
+    // For INFINITE projection, this will be degenerate (0,0,0,d)
+    // We'll skip it in culling
+    planes[5] = [
+        m[2],
+        m[6],
+        m[10],
+        m[14],
+    ];
+
+    // Normalize all planes (CRITICAL: normal must have length 1)
+    fn normalize_plane(p: &mut [f32; 4]) -> bool {
+        let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
+        if len > 1e-6 {  // Avoid division by zero
+            let inv_len = 1.0 / len;
+            p[0] *= inv_len;
+            p[1] *= inv_len;
+            p[2] *= inv_len;
+            p[3] *= inv_len;
+            true
+        } else {
+            // Degenerate plane - this is OK for infinite far plane
+            false
+        }
+    }
+
+    let mut valid_planes = [true; 6];
+    for (i, p) in planes.iter_mut().enumerate() {
+        valid_planes[i] = normalize_plane(p);
+    }
+
+    // DEBUG: Verify near plane is not degenerate
+    if rcx.elapsed_millis % 1000 < 16 {
+        let cam_pos = self.camera.position;
+        let cam_forward = self.camera.forward;
+        let test_point = cam_pos + cam_forward * 10.0;
+        
+        println!("\n=== Frustum Debug ===");
+        println!("Camera pos: {:?}", cam_pos);
+        println!("Camera forward: {:?}", cam_forward);
+        println!("Test point (10 units forward): {:?}", test_point);
+        
+        // Check if using infinite projection
+        let is_infinite = (m[2].abs() < 1e-6) && (m[6].abs() < 1e-6) && (m[10].abs() < 1e-6);
+        println!("Projection type: {}", if is_infinite { "INFINITE reverse-Z" } else { "FINITE reverse-Z" });
+        
+        for (i, plane) in planes.iter().enumerate() {
+            if !valid_planes[i] {
+                let name = match i {
+                    0 => "Left", 1 => "Right", 2 => "Bottom",
+                    3 => "Top", 4 => "Near", 5 => "Far",
+                    _ => "Unknown"
+                };
+                println!("{:7} plane: DEGENERATE (skipped in culling)", name);
+                continue;
             }
-
-            planes[0] = extract_plane(m, 0,  1.0); // Left
-            planes[1] = extract_plane(m, 0, -1.0); // Right
-            planes[2] = extract_plane(m, 1,  1.0); // Bottom
-            planes[3] = extract_plane(m, 1, -1.0); // Top
-            planes[4] = extract_plane(m, 2,  1.0); // Near
-            planes[5] = extract_plane(m, 2, -1.0); // Far
-
-            fn normalize_plane(p: &mut [f32; 4]) {
-                let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
-                p[0] /= len;
-                p[1] /= len;
-                p[2] /= len;
-                p[3] /= len;
+            
+            let dist = plane[0] * test_point.x 
+                     + plane[1] * test_point.y 
+                     + plane[2] * test_point.z 
+                     + plane[3];
+            let name = match i {
+                0 => "Left",
+                1 => "Right", 
+                2 => "Bottom",
+                3 => "Top",
+                4 => "Near",
+                5 => "Far",
+                _ => "Unknown"
+            };
+            let normal_len = (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]).sqrt();
+            println!("{:7} plane: normal=({:7.3}, {:7.3}, {:7.3}) |N|={:.3} d={:7.3}, test_dist={:7.3}", 
+                     name, plane[0], plane[1], plane[2], normal_len, plane[3], dist);
+        }
+        
+        // Verify test point should be inside frustum
+        let mut all_inside = true;
+        for (i, plane) in planes.iter().enumerate() {
+            if !valid_planes[i] {
+                continue; // Skip degenerate planes
             }
-
-            for p in planes.iter_mut() {
-                normalize_plane(p);
-            }
-
-            if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
-                w.planes = planes;
+            
+            let dist = plane[0] * test_point.x 
+                     + plane[1] * test_point.y 
+                     + plane[2] * test_point.z 
+                     + plane[3];
+            if dist < 0.0 {
+                all_inside = false;
+                let name = match i {
+                    0 => "Left", 1 => "Right", 2 => "Bottom",
+                    3 => "Top", 4 => "Near", 5 => "Far",
+                    _ => "Unknown"
+                };
+                println!("  ⚠ Test point OUTSIDE {} plane! (dist={:.3})", name, dist);
             }
         }
+        if all_inside {
+            println!("  ✓ Test point correctly inside all valid planes");
+        }
+        
+        // Test a point BEHIND camera (should be culled)
+        let behind_point = cam_pos - cam_forward * 5.0;
+        println!("\nTest point BEHIND camera: {:?}", behind_point);
+        for (i, plane) in planes.iter().enumerate() {
+            if !valid_planes[i] {
+                continue;
+            }
+            let dist = plane[0] * behind_point.x 
+                     + plane[1] * behind_point.y 
+                     + plane[2] * behind_point.z 
+                     + plane[3];
+            if i == 4 { // Near plane
+                println!("  Near plane dist for point behind: {:.3} (should be NEGATIVE)", dist);
+            }
+        }
+        
+        // Test your first object
+        if let Ok(r) = rcx.frame_transforms[image_index as usize].read() {
+            if !r.is_empty() {
+                let first_pos = Vector3::new(r[0].trs[12], r[0].trs[13], r[0].trs[14]);
+                println!("\nFirst object pos: {:?}", first_pos);
+                
+                let to_obj = first_pos - cam_pos;
+                let forward_dot = to_obj.dot(&cam_forward);
+                println!("  Distance along camera forward: {:.3} (positive = in front)", forward_dot);
+                
+                for (i, plane) in planes.iter().enumerate() {
+                    if !valid_planes[i] {
+                        continue;
+                    }
+                    let dist = plane[0] * first_pos.x
+                             + plane[1] * first_pos.y
+                             + plane[2] * first_pos.z
+                             + plane[3];
+                    let name = match i {
+                        0 => "Left", 1 => "Right", 2 => "Bottom",
+                        3 => "Top", 4 => "Near", 5 => "Far",
+                        _ => "Unknown"
+                    };
+                    let status = if dist >= 0.0 { "INSIDE" } else { "OUTSIDE" };
+                    println!("  {} plane dist: {:.3} ({})", name, dist, status);
+                }
+            }
+        }
+    }
 
+    if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
+        w.planes = planes;
+    }
+}
 
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
-            self.graphics_queue.queue_family_index(),
+            self.graphics_queue.queue_family_index(), // ← GRAPHICS queue!
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
 
         acquire_future.wait(None).unwrap();
-        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+        rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
+
+        let transforms = rcx.frame_transforms[image_index as usize].clone();
+        let visibility = rcx.visibility_buffers[image_index as usize].clone();
+        let mesh_offsets = rcx.mesh_offsets_buffers[image_index as usize].clone();
+        let indirect = rcx.indirect_buffers[image_index as usize].clone();
+        let frustum = rcx.frustum_buffers[image_index as usize].clone();
 
         {
-            rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
+            // Clear visibility buffer
+            if let Ok(mut v) = visibility.write() {
+                for x in v.iter_mut() {
+                    *x = 0;
+                }
+            }
+        }
+        let count = transforms.len() as u32;
+        let groups = (count + 255) / 256;
+
+        // ====================================================================
+        // COMPUTE PASS 1: Culling
+        // ====================================================================
+        {
+            let cull_set = DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                rcx.cull_pass.set_layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, transforms.clone()),
+                    WriteDescriptorSet::buffer(1, visibility.clone()),
+                    WriteDescriptorSet::buffer(2, frustum),
+                ],
+                [],
+            )
+            .unwrap();
+
+            unsafe {
+                builder
+                    .bind_pipeline_compute(rcx.cull_pass.pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        rcx.cull_pass.pipeline.layout().clone(),
+                        0,
+                        cull_set,
+                    )
+                    .unwrap()
+                    .dispatch([groups, 1, 1])
+                    .unwrap();
+            }
         }
 
-        let culling_future = {
-            let transforms = rcx.frame_transforms[image_index as usize].clone();
-            let mesh_count = 1;
+        // ====================================================================
+        // COMPUTE PASS 2: Prefix Sum
+        // ====================================================================
+        {
+            let prefix_set = DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                rcx.prefix_pass.set_layout.clone(),
+                [
+                    WriteDescriptorSet::buffer(0, visibility.clone()),
+                    WriteDescriptorSet::buffer(1, indirect.clone()),
+                    WriteDescriptorSet::buffer(2, mesh_offsets.clone()),
+                ],
+                [],
+            )
+            .unwrap();
 
-            let visibility = rcx.visibility_buffers[image_index as usize].clone();
-            if let Ok(mut v) = visibility.write() {
-                for x in v.iter_mut() { *x = 0; }
+            unsafe {
+                builder
+                    .bind_pipeline_compute(rcx.prefix_pass.pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        rcx.prefix_pass.pipeline.layout().clone(),
+                        0,
+                        prefix_set,
+                    )
+                    .unwrap()
+                    .push_constants(rcx.prefix_pass.pipeline.layout().clone(), 0, 1u32)
+                    .unwrap()
+                    .dispatch([groups, 1, 1])
+                    .unwrap();
             }
-            let mesh_offsets = rcx.mesh_offsets_buffers[image_index as usize].clone();
-
-            // Pass 1: Culling
-            let fut_cull = rcx.cull_pass.execute(
-                &self.command_buffer_allocator,
-                &self.compute_queue,
-                &self.descriptor_set_allocator,
-                transforms.clone(),
-                visibility.clone(),
-                rcx.frustum_buffers[image_index as usize].clone(),
-            );
-
-            // Pass 2: Prefix sum + indirect write
-            let fut_prefix = rcx.prefix_pass.execute(
-                &self.command_buffer_allocator,
-                &self.compute_queue,
-                &self.descriptor_set_allocator,
-                visibility.clone(),
-                rcx.indirect_buffers[image_index as usize].clone(),
-                mesh_offsets.clone(),
-                mesh_count,
-            );
-
-            fut_cull.join(fut_prefix)
-                .then_signal_semaphore_and_flush()
-                .unwrap()
-        };
+        }
 
         {
             // Pre-Depth instanced pass
@@ -1008,10 +1309,13 @@ impl App {
                     rcx.frame_transforms[image_index as usize].clone(),
                 )],
                 [],
-            ).unwrap();
+            )
+            .unwrap();
 
             let sets = [
-                rcx.context_descriptor_set.for_frame(image_index as usize).clone(),
+                rcx.context_descriptor_set
+                    .for_frame(image_index as usize)
+                    .clone(),
                 set,
             ];
 
@@ -1029,7 +1333,8 @@ impl App {
                         )
                     }),
                     ..Default::default()
-                }).unwrap()
+                })
+                .unwrap()
                 .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
                 .unwrap()
                 .set_scissor(0, [rcx.scissor].into_iter().collect())
@@ -1049,9 +1354,9 @@ impl App {
                 .unwrap();
 
             unsafe {
-                builder.draw_indexed_indirect(
-                    rcx.indirect_buffers[image_index as usize].clone(),
-                ).unwrap();
+                builder
+                    .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
+                    .unwrap();
             }
             builder.end_rendering().unwrap();
         }
@@ -1061,19 +1366,25 @@ impl App {
 
             let set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
-                rcx.mrt_pass.gbuffer_instanced_pipeline.layout().set_layouts()[1].clone(),
-                [WriteDescriptorSet::image_view_sampler(
-                    0,
-                    rcx.white_image_sampler.clone(),
-                    rcx.default_sampler.clone(),
-                ),
+                rcx.mrt_pass
+                    .gbuffer_instanced_pipeline
+                    .layout()
+                    .set_layouts()[1]
+                    .clone(),
+                [
+                    WriteDescriptorSet::image_view_sampler(
+                        0,
+                        rcx.white_image_sampler.clone(),
+                        rcx.default_sampler.clone(),
+                    ),
                     WriteDescriptorSet::buffer(
                         1,
                         rcx.frame_transforms[image_index as usize].clone(),
-                    )],
+                    ),
+                ],
                 [],
             )
-                .unwrap();
+            .unwrap();
 
             let sets = [
                 rcx.context_descriptor_set
@@ -1142,9 +1453,9 @@ impl App {
                 .unwrap();
 
             unsafe {
-                builder.draw_indexed_indirect(
-                    rcx.indirect_buffers[image_index as usize].clone(),
-                ).unwrap();
+                builder
+                    .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
+                    .unwrap();
             }
             builder.end_rendering().unwrap();
         }
@@ -1272,7 +1583,6 @@ impl App {
             .take()
             .unwrap()
             .join(acquire_future)
-            .join(culling_future)
             .then_execute(self.graphics_queue.clone(), command_buffer)
             .unwrap()
             .then_swapchain_present(
@@ -1316,12 +1626,20 @@ fn window_size_dependent_setup(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     default_sampler: &Arc<Sampler>,
     swapchain_images: &[Arc<Image>],
-) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass, CullPass, PrefixPass) {
+) -> (
+    SwapchainPass,
+    MRT,
+    MRTLighting,
+    Composite,
+    BloomPass,
+    CullPass,
+    PrefixPass,
+) {
     let predepth_pipeline = {
         mod vs {
             vulkano_shaders::shader! {
-            ty: "vertex",
-            src: r"
+                ty: "vertex",
+                src: r"
                 #version 450
                 layout(location = 0) in vec3 position;
 
@@ -1345,21 +1663,27 @@ fn window_size_dependent_setup(
                     gl_Position = projection * (view * world_pos);
                 }
             "
-        }
+            }
         }
 
         mod fs {
             vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r"
+                ty: "fragment",
+                src: r"
                 #version 450
                 void main() { }
             "
-        }
+            }
         }
 
-        let vs = vs::load(device.clone()).unwrap().entry_point("main").unwrap();
-        let fs = fs::load(device.clone()).unwrap().entry_point("main").unwrap();
+        let vs = vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
 
         let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
 
@@ -1390,9 +1714,10 @@ fn window_size_dependent_setup(
                     set_layouts,
                     push_constant_ranges: vec![],
                 }
-                    .into_pipeline_layout_create_info(device.clone()).unwrap(),
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
             )
-                .unwrap()
+            .unwrap()
         };
 
         let mut ci = GraphicsPipelineCreateInfo::layout(layout);
@@ -1532,7 +1857,7 @@ fn window_size_dependent_setup(
                     .into_pipeline_layout_create_info(device.clone())
                     .unwrap(),
             )
-                .unwrap()
+            .unwrap()
         };
 
         let mut ci = GraphicsPipelineCreateInfo::layout(layout);
@@ -1551,7 +1876,10 @@ fn window_size_dependent_setup(
         ci.multisample_state = Some(MultisampleState::default());
         ci.subpass = Some(subpass.into());
         ci.depth_stencil_state = Some(DepthStencilState {
-            depth: Some(DepthState { write_enable: false, compare_op: CompareOp::Equal }),
+            depth: Some(DepthState {
+                write_enable: false,
+                compare_op: CompareOp::Equal,
+            }),
             ..Default::default()
         });
         ci.stages = stages.into_iter().collect();
@@ -1680,7 +2008,7 @@ fn window_size_dependent_setup(
                     .into_pipeline_layout_create_info(device.clone())
                     .unwrap(),
             )
-                .unwrap()
+            .unwrap()
         };
 
         let mut ci = GraphicsPipelineCreateInfo::layout(layout);
@@ -2284,7 +2612,15 @@ fn window_size_dependent_setup(
         pass
     };
 
-    let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device, &descriptor_set_allocator);
+    let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
 
-    (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull_compute_pass, cull_prefix_pass)
+    (
+        swapchain_pass,
+        mrt,
+        mrt_lighting,
+        composite,
+        bloom_pass,
+        cull_compute_pass,
+        cull_prefix_pass,
+    )
 }

@@ -22,35 +22,28 @@ layout(push_constant) uniform Push {
 };
 
 layout(set=0, binding=2, std430) readonly buffer MeshOffsets {
-    uint offsets[];  // length = mesh_count+1
+    uint offsets[];
 };
-
-shared uint prefix_local[256];
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-
-    uint v = vis[gid];
-    prefix_local[lid] = v;
-    memoryBarrierShared();
-    barrier();
-
-    for(uint off = 1; off < gl_WorkGroupSize.x; off <<= 1) {
-        uint p = (lid >= off) ? prefix_local[lid - off] : 0;
-        barrier();
-        prefix_local[lid] += p;
-        barrier();
+    
+    // Bounds check
+    if (gid >= vis.length()) {
+        return;
     }
-
-    if (v == 1) {
+    
+    uint visible = vis[gid];
+    
+    if (visible == 1u) {
+        // Find which mesh this instance belongs to
         for (uint m = 0; m < mesh_count; ++m) {
             uint base = offsets[m];
             uint next = offsets[m + 1];
-
+            
             if (gid >= base && gid < next) {
-                atomicAdd(cmds[m].instance_count, 1);
-                return;
+                atomicAdd(cmds[m].instance_count, 1u);
+                break; // Important: stop after finding the mesh
             }
         }
     }

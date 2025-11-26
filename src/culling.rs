@@ -2,20 +2,32 @@ use crate::{FrustumPlanes, TransformTRS};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, DrawIndexedIndirectCommand, PrimaryAutoCommandBuffer};
-use vulkano::descriptor_set::DescriptorSet;
-use vulkano::pipeline::{PipelineBindPoint, PipelineShaderStageCreateInfo};
-use vulkano::{buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer}, descriptor_set::layout::{
-    DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
-}, descriptor_set::{WriteDescriptorSet, allocator::StandardDescriptorSetAllocator}, device::Device, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
-    ComputePipeline, Pipeline, PipelineLayout, compute::ComputePipelineCreateInfo,
-    layout::PipelineLayoutCreateInfo,
-}, shader::ShaderStages, sync};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferUsage, DrawIndexedIndirectCommand,
+    PrimaryAutoCommandBuffer,
+};
+use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::{DeviceOwned, Queue};
 use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::layout::PushConstantRange;
+use vulkano::pipeline::{PipelineBindPoint, PipelineShaderStageCreateInfo};
 use vulkano::sync::GpuFuture;
+use vulkano::{
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
+    descriptor_set::layout::{
+        DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
+    },
+    descriptor_set::{WriteDescriptorSet, allocator::StandardDescriptorSetAllocator},
+    device::Device,
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{
+        ComputePipeline, Pipeline, PipelineLayout, compute::ComputePipelineCreateInfo,
+        layout::PipelineLayoutCreateInfo,
+    },
+    shader::ShaderStages,
+    sync,
+};
 
 pub struct CullPass {
     pub pipeline: Arc<ComputePipeline>,
@@ -27,10 +39,7 @@ pub struct PrefixPass {
     pub set_layout: Arc<DescriptorSetLayout>,
 }
 
-pub fn construct_culling_passes(
-    device: &Arc<Device>,
-    set_alloc: &Arc<StandardDescriptorSetAllocator>,
-) -> (CullPass, PrefixPass) {
+pub fn construct_culling_passes(device: &Arc<Device>) -> (CullPass, PrefixPass) {
     //
     // === VISIBILITY CULLING SHADER ===
     //
@@ -194,12 +203,16 @@ impl CullPass {
     ) -> Box<dyn GpuFuture> {
         let count = transforms.len() as u32;
 
+        if count == 0 {
+            return sync::now(queue.device().clone()).boxed();
+        }
+
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             cb_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-            .unwrap();
+        .unwrap();
 
         let set = DescriptorSet::new(
             allocator.clone(),
@@ -216,13 +229,16 @@ impl CullPass {
         let groups = (count + 255) / 256;
 
         unsafe {
-            command_buffer_builder.begin_debug_utils_label(DebugUtilsLabel {
-                label_name: "Cull compute".to_string(),
-                color: [0.1, 0.2, 0.8, 1.0],
-                ..Default::default()
-            }).unwrap();
+            command_buffer_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Cull compute".to_string(),
+                    color: [0.1, 0.2, 0.8, 1.0],
+                    ..Default::default()
+                })
+                .unwrap();
 
-            command_buffer_builder.bind_pipeline_compute(self.pipeline.clone())
+            command_buffer_builder
+                .bind_pipeline_compute(self.pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Compute,
@@ -257,12 +273,16 @@ impl PrefixPass {
     ) -> Box<dyn GpuFuture> {
         let count = visibility.len() as u32;
 
+        if count == 0 {
+            return sync::now(queue.device().clone()).boxed();
+        }
+
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             cb_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-            .unwrap();
+        .unwrap();
 
         let set = DescriptorSet::new(
             allocator.clone(),
@@ -279,12 +299,15 @@ impl PrefixPass {
         let groups = (count + 255) / 256;
 
         unsafe {
-            command_buffer_builder.begin_debug_utils_label(DebugUtilsLabel {
-                label_name: "Prefix-sum post culling".to_string(),
-                color: [0.1, 0.9, 0.8, 1.0],
-                ..Default::default()
-            }).unwrap();
-            command_buffer_builder.bind_pipeline_compute(self.pipeline.clone())
+            command_buffer_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Prefix-sum post culling".to_string(),
+                    color: [0.1, 0.9, 0.8, 1.0],
+                    ..Default::default()
+                })
+                .unwrap();
+            command_buffer_builder
+                .bind_pipeline_compute(self.pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Compute,

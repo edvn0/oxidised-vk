@@ -14,7 +14,9 @@ use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::layout::{PipelineLayout, PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::{ComputePipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{
+    ComputePipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
+};
 use vulkano::shader::ShaderStages;
 
 struct BloomStage {
@@ -73,7 +75,7 @@ impl BloomPass {
                 },
                 AllocationCreateInfo::default(),
             )
-                .unwrap();
+            .unwrap();
             ImageView::new_default(img).unwrap()
         };
 
@@ -93,7 +95,7 @@ impl BloomPass {
                 ..Default::default()
             },
         )
-            .unwrap();
+        .unwrap();
 
         // Descriptor layout for extract (2 storage images)
         let make_storage_layout = |device: &Arc<Device>, pc_size: u32| {
@@ -129,7 +131,7 @@ impl BloomPass {
                     ..Default::default()
                 },
             )
-                .unwrap();
+            .unwrap();
 
             (desc_layout, layout)
         };
@@ -171,7 +173,7 @@ impl BloomPass {
                     ..Default::default()
                 },
             )
-                .unwrap();
+            .unwrap();
 
             (desc_layout, layout)
         };
@@ -344,7 +346,7 @@ impl BloomPass {
                 extract_pipe_layout,
             ),
         )
-            .unwrap();
+        .unwrap();
         let extract = BloomStage {
             pipeline: extract_pipeline,
             layout: extract_layout,
@@ -366,7 +368,7 @@ impl BloomPass {
                 downsample_pipe_layout,
             ),
         )
-            .unwrap();
+        .unwrap();
         let downsample = BloomStage {
             pipeline: downsample_pipeline,
             layout: downsample_layout,
@@ -388,7 +390,7 @@ impl BloomPass {
                 upsample_pipe_layout,
             ),
         )
-            .unwrap();
+        .unwrap();
         let upsample = BloomStage {
             pipeline: upsample_pipeline,
             layout: upsample_layout,
@@ -433,7 +435,7 @@ impl BloomPass {
             ],
             [],
         )
-            .unwrap();
+        .unwrap();
 
         builder
             .bind_pipeline_compute(self.extract.pipeline.clone())
@@ -480,7 +482,7 @@ impl BloomPass {
                 ],
                 [],
             )
-                .unwrap();
+            .unwrap();
 
             builder
                 .bind_pipeline_compute(self.downsample.pipeline.clone())
@@ -534,7 +536,7 @@ impl BloomPass {
                 ],
                 [],
             )
-                .unwrap();
+            .unwrap();
 
             builder
                 .bind_pipeline_compute(self.upsample.pipeline.clone())
@@ -568,7 +570,9 @@ impl BloomPass {
             }
         }
 
-        unsafe {builder.end_debug_utils_label().unwrap(); }
+        unsafe {
+            builder.end_debug_utils_label().unwrap();
+        }
     }
 
     pub fn result(&self) -> Arc<ImageView> {

@@ -1,5 +1,7 @@
 use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::layout::{DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType};
+use vulkano::descriptor_set::layout::{
+    DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
+};
 use vulkano::shader::ShaderStages;
 
 #[derive(BufferContents)]

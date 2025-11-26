@@ -44,12 +44,24 @@ impl Camera {
     pub fn update_from_input(&mut self, input: &InputState, dt: f32) {
         // Movement
         let mut move_dir = Vector3::zeros();
-        if input.forward  { move_dir += self.forward; }
-        if input.backward { move_dir -= self.forward; }
-        if input.left     { move_dir -= self.right; }
-        if input.right    { move_dir += self.right; }
-        if input.up       { move_dir += self.up; }
-        if input.down     { move_dir -= self.up; }
+        if input.forward {
+            move_dir += self.forward;
+        }
+        if input.backward {
+            move_dir -= self.forward;
+        }
+        if input.left {
+            move_dir -= self.right;
+        }
+        if input.right {
+            move_dir += self.right;
+        }
+        if input.up {
+            move_dir += self.up;
+        }
+        if input.down {
+            move_dir -= self.up;
+        }
 
         if move_dir != Vector3::zeros() {
             self.position += move_dir.normalize() * self.speed * dt;
@@ -83,12 +95,8 @@ impl Camera {
         let az = 0.8_f32;
         let ph = 0.6_f32;
 
-        let sun_world = Vector3::new(
-            ph.cos() * az.sin(),
-            ph.sin(),
-            ph.cos() * az.cos(),
-        )
-            .normalize();
+        let sun_world =
+            Vector3::new(ph.cos() * az.sin(), ph.sin(), ph.cos() * az.cos()).normalize();
 
         let view = self.view_matrix();
         let view_rot = view.fixed_view::<3, 3>(0, 0);

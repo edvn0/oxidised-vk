@@ -1,10 +1,10 @@
+use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use std::sync::Arc;
-use vulkano::buffer::{Subbuffer};
+use vulkano::buffer::Subbuffer;
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::layout::DescriptorSetLayout;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::descriptor_set::layout::{DescriptorSetLayout};
 use vulkano::device::Device;
-use crate::shader_bindings::{renderer_set_0_layouts, RendererUBO};
 
 pub struct FrameDescriptorSet {
     sets: Vec<Arc<DescriptorSet>>,
