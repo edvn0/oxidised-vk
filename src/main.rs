@@ -1,3 +1,4 @@
+extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
 mod culling;
@@ -12,7 +13,7 @@ use crate::culling::{CullPass, PrefixPass, construct_culling_passes};
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
-use nalgebra::{Matrix4, Rotation3, Translation3, Vector3};
+use nalgebra::{Matrix4, Translation3, Vector3};
 use rand::Rng;
 use std::collections::BTreeMap;
 use std::default::Default;
@@ -30,11 +31,12 @@ use vulkano::image::sampler::{
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{ImageAspects, ImageSubresourceRange, SampleCount};
 use vulkano::instance::InstanceExtensions;
-use vulkano::pipeline::ComputePipeline;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
+use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace};
 use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
+use vulkano::sync::semaphore::{Semaphore, SemaphoreCreateInfo, SemaphoreType};
 use vulkano::{
     DeviceSize, Validated, Version, VulkanError, VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -90,8 +92,6 @@ use winit::{
     window::{Window, WindowId},
 };
 
-extern crate nalgebra_glm as glm;
-
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop).unwrap();
@@ -109,7 +109,7 @@ struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
-    compute_queue: Arc<Queue>,
+    _compute_queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
@@ -233,8 +233,9 @@ impl App {
         )
         .unwrap();
 
-        let mut device_extensions = DeviceExtensions {
+        let device_extensions = DeviceExtensions {
             khr_swapchain: true,
+            khr_timeline_semaphore: true,
             ..DeviceExtensions::empty()
         };
 
@@ -308,6 +309,7 @@ impl App {
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     dynamic_rendering: true,
+                    timeline_semaphore: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -379,57 +381,6 @@ impl App {
             });
         }
 
-        
-// Calculate actual mesh bounding sphere
-let mut min_x = f32::MAX;
-let mut max_x = f32::MIN;
-let mut min_y = f32::MAX;
-let mut max_y = f32::MIN;
-let mut min_z = f32::MAX;
-let mut max_z = f32::MIN;
-
-for i in 0..mesh.positions.len()/3 {
-    let x = mesh.positions[i * 3 + 0];
-    let y = mesh.positions[i * 3 + 1];
-    let z = mesh.positions[i * 3 + 2];
-    
-    min_x = min_x.min(x);
-    max_x = max_x.max(x);
-    min_y = min_y.min(y);
-    max_y = max_y.max(y);
-    min_z = min_z.min(z);
-    max_z = max_z.max(z);
-}
-
-let center = [
-    (min_x + max_x) / 2.0,
-    (min_y + max_y) / 2.0,
-    (min_z + max_z) / 2.0,
-];
-
-// Calculate radius as max distance from center
-let mut max_radius_sq = 0.0f32;
-for i in 0..mesh.positions.len()/3 {
-    let x = mesh.positions[i * 3 + 0] - center[0];
-    let y = mesh.positions[i * 3 + 1] - center[1];
-    let z = mesh.positions[i * 3 + 2] - center[2];
-    let dist_sq = x*x + y*y + z*z;
-    max_radius_sq = max_radius_sq.max(dist_sq);
-}
-
-let radius = max_radius_sq.sqrt();
-
-println!("\n=== MESH BOUNDS ===");
-println!("Bounding box:");
-println!("  X: {:.3} to {:.3}", min_x, max_x);
-println!("  Y: {:.3} to {:.3}", min_y, max_y);
-println!("  Z: {:.3} to {:.3}", min_z, max_z);
-println!("Center: ({:.3}, {:.3}, {:.3})", center[0], center[1], center[2]);
-println!("Bounding sphere radius: {:.3}", radius);
-println!("\n⚠️  UPDATE your cull.comp shader:");
-println!("    const float BASE_RADIUS = {:.3};", radius);
-println!("===================\n");
-
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -464,7 +415,7 @@ println!("===================\n");
             instance,
             device,
             graphics_queue,
-            compute_queue,
+            _compute_queue: compute_queue,
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
@@ -974,6 +925,8 @@ impl App {
             rcx.recreate_swapchain = true;
         }
 
+        acquire_future.wait(None).unwrap();
+
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         {
@@ -989,230 +942,219 @@ impl App {
             }
         }
 
-        // Replace your frustum calculation with this corrected version
+        {
+            let view = self.camera.view_matrix();
+            let proj = self.camera.projection_matrix(
+                rcx.window.inner_size().width as f32 / rcx.window.inner_size().height as f32,
+            );
+            let vp = proj * view;
 
-        // Replace your frustum calculation with this corrected version
+            let mut planes = [[0f32; 4]; 6];
+            let m = vp.as_slice();
 
-        // Replace your frustum calculation with this corrected version
+            // Left plane: clip.w + clip.x >= 0
+            planes[0] = [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]];
 
-{
-    let view = self.camera.view_matrix();
-    let proj = self.camera.projection_matrix(
-        rcx.window.inner_size().width as f32
-            / rcx.window.inner_size().height as f32
-    );
-    let vp = proj * view;
+            // Right plane: clip.w - clip.x >= 0
+            planes[1] = [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]];
 
-    let mut planes = [[0f32; 4]; 6];
-    let m = vp.as_slice();
+            // Bottom plane: clip.w + clip.y >= 0
+            planes[2] = [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]];
 
-    // Standard plane extraction (works for all 6 planes with reverse-Z)
-    // Format: Plane equation is Nx*x + Ny*y + Nz*z + d = 0
-    // A point is inside if the result is >= 0 (with outward-facing normals)
-    
-    // Left plane: clip.w + clip.x >= 0
-    planes[0] = [
-        m[3] + m[0],
-        m[7] + m[4],
-        m[11] + m[8],
-        m[15] + m[12],
-    ];
-    
-    // Right plane: clip.w - clip.x >= 0
-    planes[1] = [
-        m[3] - m[0],
-        m[7] - m[4],
-        m[11] - m[8],
-        m[15] - m[12],
-    ];
-    
-    // Bottom plane: clip.w + clip.y >= 0
-    planes[2] = [
-        m[3] + m[1],
-        m[7] + m[5],
-        m[11] + m[9],
-        m[15] + m[13],
-    ];
-    
-    // Top plane: clip.w - clip.y >= 0
-    planes[3] = [
-        m[3] - m[1],
-        m[7] - m[5],
-        m[11] - m[9],
-        m[15] - m[13],
-    ];
-    
-    // For REVERSE-Z where near=1.0, far=0.0:
-    // In clip space: z/w goes from 1.0 (near) to 0.0 (far)
-    
-    // Near plane: clip.w - clip.z >= 0  (because z/w <= 1.0)
-    // This is: w - z >= 0, or equivalently: 1.0 - (z/w) >= 0
-    planes[4] = [
-        m[3] - m[2],
-        m[7] - m[6],
-        m[11] - m[10],
-        m[15] - m[14],
-    ];
-    
-    // Far plane: clip.z >= 0  (because z/w >= 0.0)
-    // For INFINITE projection, this will be degenerate (0,0,0,d)
-    // We'll skip it in culling
-    planes[5] = [
-        m[2],
-        m[6],
-        m[10],
-        m[14],
-    ];
+            // Top plane: clip.w - clip.y >= 0
+            planes[3] = [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]];
 
-    // Normalize all planes (CRITICAL: normal must have length 1)
-    fn normalize_plane(p: &mut [f32; 4]) -> bool {
-        let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
-        if len > 1e-6 {  // Avoid division by zero
-            let inv_len = 1.0 / len;
-            p[0] *= inv_len;
-            p[1] *= inv_len;
-            p[2] *= inv_len;
-            p[3] *= inv_len;
-            true
-        } else {
-            // Degenerate plane - this is OK for infinite far plane
-            false
-        }
-    }
+            // For REVERSE-Z where near=1.0, far=0.0:
+            // In clip space: z/w goes from 1.0 (near) to 0.0 (far)
 
-    let mut valid_planes = [true; 6];
-    for (i, p) in planes.iter_mut().enumerate() {
-        valid_planes[i] = normalize_plane(p);
-    }
+            // Near plane: clip.w - clip.z >= 0  (because z/w <= 1.0)
+            // This is: w - z >= 0, or equivalently: 1.0 - (z/w) >= 0
+            planes[4] = [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]];
 
-    // DEBUG: Verify near plane is not degenerate
-    if rcx.elapsed_millis % 1000 < 16 {
-        let cam_pos = self.camera.position;
-        let cam_forward = self.camera.forward;
-        let test_point = cam_pos + cam_forward * 10.0;
-        
-        println!("\n=== Frustum Debug ===");
-        println!("Camera pos: {:?}", cam_pos);
-        println!("Camera forward: {:?}", cam_forward);
-        println!("Test point (10 units forward): {:?}", test_point);
-        
-        // Check if using infinite projection
-        let is_infinite = (m[2].abs() < 1e-6) && (m[6].abs() < 1e-6) && (m[10].abs() < 1e-6);
-        println!("Projection type: {}", if is_infinite { "INFINITE reverse-Z" } else { "FINITE reverse-Z" });
-        
-        for (i, plane) in planes.iter().enumerate() {
-            if !valid_planes[i] {
-                let name = match i {
-                    0 => "Left", 1 => "Right", 2 => "Bottom",
-                    3 => "Top", 4 => "Near", 5 => "Far",
-                    _ => "Unknown"
-                };
-                println!("{:7} plane: DEGENERATE (skipped in culling)", name);
-                continue;
+            // Far plane: clip.z >= 0  (because z/w >= 0.0)
+            // For INFINITE projection, this will be degenerate (0,0,0,d)
+            // We'll skip it in culling
+            planes[5] = [m[2], m[6], m[10], m[14]];
+
+            // Normalize all planes (CRITICAL: normal must have length 1)
+            fn normalize_plane(p: &mut [f32; 4]) -> bool {
+                let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                if len > 1e-6 {
+                    // Avoid division by zero
+                    let inv_len = 1.0 / len;
+                    p[0] *= inv_len;
+                    p[1] *= inv_len;
+                    p[2] *= inv_len;
+                    p[3] *= inv_len;
+                    true
+                } else {
+                    // Degenerate plane - this is OK for infinite far plane
+                    false
+                }
             }
-            
-            let dist = plane[0] * test_point.x 
-                     + plane[1] * test_point.y 
-                     + plane[2] * test_point.z 
-                     + plane[3];
-            let name = match i {
-                0 => "Left",
-                1 => "Right", 
-                2 => "Bottom",
-                3 => "Top",
-                4 => "Near",
-                5 => "Far",
-                _ => "Unknown"
-            };
-            let normal_len = (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]).sqrt();
-            println!("{:7} plane: normal=({:7.3}, {:7.3}, {:7.3}) |N|={:.3} d={:7.3}, test_dist={:7.3}", 
-                     name, plane[0], plane[1], plane[2], normal_len, plane[3], dist);
-        }
-        
-        // Verify test point should be inside frustum
-        let mut all_inside = true;
-        for (i, plane) in planes.iter().enumerate() {
-            if !valid_planes[i] {
-                continue; // Skip degenerate planes
+
+            let mut valid_planes = [true; 6];
+            for (i, p) in planes.iter_mut().enumerate() {
+                valid_planes[i] = normalize_plane(p);
             }
-            
-            let dist = plane[0] * test_point.x 
-                     + plane[1] * test_point.y 
-                     + plane[2] * test_point.z 
-                     + plane[3];
-            if dist < 0.0 {
-                all_inside = false;
-                let name = match i {
-                    0 => "Left", 1 => "Right", 2 => "Bottom",
-                    3 => "Top", 4 => "Near", 5 => "Far",
-                    _ => "Unknown"
-                };
-                println!("  ⚠ Test point OUTSIDE {} plane! (dist={:.3})", name, dist);
-            }
-        }
-        if all_inside {
-            println!("  ✓ Test point correctly inside all valid planes");
-        }
-        
-        // Test a point BEHIND camera (should be culled)
-        let behind_point = cam_pos - cam_forward * 5.0;
-        println!("\nTest point BEHIND camera: {:?}", behind_point);
-        for (i, plane) in planes.iter().enumerate() {
-            if !valid_planes[i] {
-                continue;
-            }
-            let dist = plane[0] * behind_point.x 
-                     + plane[1] * behind_point.y 
-                     + plane[2] * behind_point.z 
-                     + plane[3];
-            if i == 4 { // Near plane
-                println!("  Near plane dist for point behind: {:.3} (should be NEGATIVE)", dist);
-            }
-        }
-        
-        // Test your first object
-        if let Ok(r) = rcx.frame_transforms[image_index as usize].read() {
-            if !r.is_empty() {
-                let first_pos = Vector3::new(r[0].trs[12], r[0].trs[13], r[0].trs[14]);
-                println!("\nFirst object pos: {:?}", first_pos);
-                
-                let to_obj = first_pos - cam_pos;
-                let forward_dot = to_obj.dot(&cam_forward);
-                println!("  Distance along camera forward: {:.3} (positive = in front)", forward_dot);
-                
+
+            // DEBUG: Verify near plane is not degenerate
+            #[cfg(debug_assertions)]
+            if rcx.elapsed_millis % 1000 < 16 {
+                let cam_pos = self.camera.position;
+                let cam_forward = self.camera.forward;
+                let test_point = cam_pos + cam_forward * 10.0;
+
+                println!("\n=== Frustum Debug ===");
+                println!("Camera pos: {:?}", cam_pos);
+                println!("Camera forward: {:?}", cam_forward);
+                println!("Test point (10 units forward): {:?}", test_point);
+
+                // Check if using infinite projection
+                let is_infinite =
+                    (m[2].abs() < 1e-6) && (m[6].abs() < 1e-6) && (m[10].abs() < 1e-6);
+                println!(
+                    "Projection type: {}",
+                    if is_infinite {
+                        "INFINITE reverse-Z"
+                    } else {
+                        "FINITE reverse-Z"
+                    }
+                );
+
+                for (i, plane) in planes.iter().enumerate() {
+                    if !valid_planes[i] {
+                        let name = match i {
+                            0 => "Left",
+                            1 => "Right",
+                            2 => "Bottom",
+                            3 => "Top",
+                            4 => "Near",
+                            5 => "Far",
+                            _ => "Unknown",
+                        };
+                        println!("{:7} plane: DEGENERATE (skipped in culling)", name);
+                        continue;
+                    }
+
+                    let dist = plane[0] * test_point.x
+                        + plane[1] * test_point.y
+                        + plane[2] * test_point.z
+                        + plane[3];
+                    let name = match i {
+                        0 => "Left",
+                        1 => "Right",
+                        2 => "Bottom",
+                        3 => "Top",
+                        4 => "Near",
+                        5 => "Far",
+                        _ => "Unknown",
+                    };
+                    let normal_len =
+                        (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+                    println!(
+                        "{:7} plane: normal=({:7.3}, {:7.3}, {:7.3}) |N|={:.3} d={:7.3}, test_dist={:7.3}",
+                        name, plane[0], plane[1], plane[2], normal_len, plane[3], dist
+                    );
+                }
+
+                // Verify test point should be inside frustum
+                let mut all_inside = true;
+                for (i, plane) in planes.iter().enumerate() {
+                    if !valid_planes[i] {
+                        continue; // Skip degenerate planes
+                    }
+
+                    let dist = plane[0] * test_point.x
+                        + plane[1] * test_point.y
+                        + plane[2] * test_point.z
+                        + plane[3];
+                    if dist < 0.0 {
+                        all_inside = false;
+                        let name = match i {
+                            0 => "Left",
+                            1 => "Right",
+                            2 => "Bottom",
+                            3 => "Top",
+                            4 => "Near",
+                            5 => "Far",
+                            _ => "Unknown",
+                        };
+                        println!("  ⚠ Test point OUTSIDE {} plane! (dist={:.3})", name, dist);
+                    }
+                }
+                if all_inside {
+                    println!("  ✓ Test point correctly inside all valid planes");
+                }
+
+                // Test a point BEHIND camera (should be culled)
+                let behind_point = cam_pos - cam_forward * 5.0;
+                println!("\nTest point BEHIND camera: {:?}", behind_point);
                 for (i, plane) in planes.iter().enumerate() {
                     if !valid_planes[i] {
                         continue;
                     }
-                    let dist = plane[0] * first_pos.x
-                             + plane[1] * first_pos.y
-                             + plane[2] * first_pos.z
-                             + plane[3];
-                    let name = match i {
-                        0 => "Left", 1 => "Right", 2 => "Bottom",
-                        3 => "Top", 4 => "Near", 5 => "Far",
-                        _ => "Unknown"
-                    };
-                    let status = if dist >= 0.0 { "INSIDE" } else { "OUTSIDE" };
-                    println!("  {} plane dist: {:.3} ({})", name, dist, status);
+                    let dist = plane[0] * behind_point.x
+                        + plane[1] * behind_point.y
+                        + plane[2] * behind_point.z
+                        + plane[3];
+                    if i == 4 {
+                        // Near plane
+                        println!(
+                            "  Near plane dist for point behind: {:.3} (should be NEGATIVE)",
+                            dist
+                        );
+                    }
+                }
+
+                // Test your first object
+                if let Ok(r) = rcx.frame_transforms[image_index as usize].read() {
+                    if !r.is_empty() {
+                        let first_pos = Vector3::new(r[0].trs[12], r[0].trs[13], r[0].trs[14]);
+                        println!("\nFirst object pos: {:?}", first_pos);
+
+                        let to_obj = first_pos - cam_pos;
+                        let forward_dot = to_obj.dot(&cam_forward);
+                        println!(
+                            "  Distance along camera forward: {:.3} (positive = in front)",
+                            forward_dot
+                        );
+
+                        for (i, plane) in planes.iter().enumerate() {
+                            if !valid_planes[i] {
+                                continue;
+                            }
+                            let dist = plane[0] * first_pos.x
+                                + plane[1] * first_pos.y
+                                + plane[2] * first_pos.z
+                                + plane[3];
+                            let name = match i {
+                                0 => "Left",
+                                1 => "Right",
+                                2 => "Bottom",
+                                3 => "Top",
+                                4 => "Near",
+                                5 => "Far",
+                                _ => "Unknown",
+                            };
+                            let status = if dist >= 0.0 { "INSIDE" } else { "OUTSIDE" };
+                            println!("  {} plane dist: {:.3} ({})", name, dist, status);
+                        }
+                    }
                 }
             }
+
+            if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
+                w.planes = planes;
+            }
         }
-    }
 
-    if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
-        w.planes = planes;
-    }
-}
-
-        let mut builder = AutoCommandBufferBuilder::primary(
+        let mut graphics_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
-            self.graphics_queue.queue_family_index(), // ← GRAPHICS queue!
+            self.graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
-
-        acquire_future.wait(None).unwrap();
 
         rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
 
@@ -1250,7 +1192,13 @@ impl App {
             .unwrap();
 
             unsafe {
-                builder
+                graphics_builder
+                    .begin_debug_utils_label(DebugUtilsLabel {
+                        label_name: "Cull compute".to_string(),
+                        color: [0.1, 0.9, 0.5, 1.0],
+                        ..Default::default()
+                    })
+                    .unwrap()
                     .bind_pipeline_compute(rcx.cull_pass.pipeline.clone())
                     .unwrap()
                     .bind_descriptor_sets(
@@ -1261,9 +1209,11 @@ impl App {
                     )
                     .unwrap()
                     .dispatch([groups, 1, 1])
+                    .unwrap()
+                    .end_debug_utils_label()
                     .unwrap();
             }
-        }
+        };
 
         // ====================================================================
         // COMPUTE PASS 2: Prefix Sum
@@ -1282,7 +1232,13 @@ impl App {
             .unwrap();
 
             unsafe {
-                builder
+                graphics_builder
+                    .begin_debug_utils_label(DebugUtilsLabel {
+                        label_name: "Cull prefix compute".to_string(),
+                        color: [0.1, 0.5, 0.9, 1.0],
+                        ..Default::default()
+                    })
+                    .unwrap()
                     .bind_pipeline_compute(rcx.prefix_pass.pipeline.clone())
                     .unwrap()
                     .bind_descriptor_sets(
@@ -1295,9 +1251,11 @@ impl App {
                     .push_constants(rcx.prefix_pass.pipeline.layout().clone(), 0, 1u32)
                     .unwrap()
                     .dispatch([groups, 1, 1])
+                    .unwrap()
+                    .end_debug_utils_label()
                     .unwrap();
             }
-        }
+        };
 
         {
             // Pre-Depth instanced pass
@@ -1319,7 +1277,13 @@ impl App {
                 set,
             ];
 
-            builder
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Predepth Z".to_string(),
+                    color: [0.1, 0.1, 0.9, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
@@ -1327,7 +1291,7 @@ impl App {
                     depth_attachment: Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
-                        clear_value: Some(ClearValue::Depth(0.0)),
+                        clear_value: Some(ClearValue::Depth(1.0)),
                         ..RenderingAttachmentInfo::image_view(
                             rcx.mrt_pass.gbuffer_depth_view.clone(),
                         )
@@ -1354,11 +1318,15 @@ impl App {
                 .unwrap();
 
             unsafe {
-                builder
+                graphics_builder
                     .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
                     .unwrap();
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
             }
-            builder.end_rendering().unwrap();
         }
 
         {
@@ -1393,7 +1361,13 @@ impl App {
                 set,
             ];
 
-            builder
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Instanced MRT Geometry".to_string(),
+                    color: [0.99, 0.1, 0.1, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
@@ -1453,11 +1427,15 @@ impl App {
                 .unwrap();
 
             unsafe {
-                builder
+                graphics_builder
                     .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
                     .unwrap();
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
             }
-            builder.end_rendering().unwrap();
         }
 
         {
@@ -1469,7 +1447,13 @@ impl App {
                 rcx.mrt_lighting.set.clone(),
             ];
 
-            builder
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "MRT Lighting".to_string(),
+                    color: [0.1, 0.99, 0.9, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
@@ -1492,14 +1476,20 @@ impl App {
                 )
                 .unwrap();
 
-            unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-            builder.end_rendering().unwrap();
+            unsafe {
+                graphics_builder.draw(3, 1, 0, 0).unwrap();
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
+            };
         }
 
         {
             // Pass 2.1: Bloom
             rcx.bloom_pass.run(
-                &mut builder,
+                &mut graphics_builder,
                 &self.descriptor_set_allocator,
                 rcx.mrt_lighting.image_view.clone(),
                 1.0, // bloom intensity
@@ -1513,7 +1503,13 @@ impl App {
 
             const PCS: [f32; 1] = [1.0];
 
-            builder
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Compositing".to_string(),
+                    color: [0.99, 0.99, 0.0, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
@@ -1538,8 +1534,14 @@ impl App {
                 )
                 .unwrap();
 
-            unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-            builder.end_rendering().unwrap();
+            unsafe {
+                graphics_builder.draw(3, 1, 0, 0).unwrap();
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
+            };
         }
 
         {
@@ -1547,7 +1549,13 @@ impl App {
 
             let descriptor_sets = vec![rcx.swapchain_pass.set.clone()];
 
-            builder
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Compositing".to_string(),
+                    color: [0.99, 0.99, 0.0, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
@@ -1572,18 +1580,25 @@ impl App {
                 )
                 .unwrap();
 
-            unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-            builder.end_rendering().unwrap();
+            unsafe {
+                graphics_builder.draw(3, 1, 0, 0).unwrap();
+
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
+            };
         }
 
-        let command_buffer = builder.build().unwrap();
+        let cmd_buf = graphics_builder.build().unwrap();
 
         let future = rcx
             .previous_frame_end
             .take()
             .unwrap()
             .join(acquire_future)
-            .then_execute(self.graphics_queue.clone(), command_buffer)
+            .then_execute(self.graphics_queue.clone(), cmd_buf)
             .unwrap()
             .then_swapchain_present(
                 self.graphics_queue.clone(),
@@ -1592,15 +1607,13 @@ impl App {
             .then_signal_fence_and_flush();
 
         match future.map_err(Validated::unwrap) {
-            Ok(future) => {
-                rcx.previous_frame_end = Some(future.boxed());
-            }
+            Ok(f) => rcx.previous_frame_end = Some(f.boxed()),
             Err(VulkanError::OutOfDate) => {
                 rcx.recreate_swapchain = true;
                 rcx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
             Err(e) => {
-                println!("failed to flush future: {e}");
+                eprintln!("present failed: {e}");
                 rcx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
         }
@@ -1724,10 +1737,22 @@ fn window_size_dependent_setup(
         ci.vertex_input_state = Some(vertex_input_state);
         ci.input_assembly_state = Some(InputAssemblyState::default());
         ci.viewport_state = Some(ViewportState::default());
-        ci.rasterization_state = Some(RasterizationState::default());
+        ci.rasterization_state = Some(RasterizationState {
+            depth_clamp_enable: false,
+            rasterizer_discard_enable: false,
+            polygon_mode: Default::default(),
+            cull_mode: CullMode::Back,
+            front_face: FrontFace::CounterClockwise,
+            depth_bias: None,
+            line_width: 1.0,
+            line_rasterization_mode: Default::default(),
+            line_stipple: None,
+            conservative: None,
+            ..Default::default()
+        });
         ci.multisample_state = Some(MultisampleState::default());
         ci.depth_stencil_state = Some(DepthStencilState {
-            depth: Some(DepthState::reverse()), // Important
+            depth: Some(DepthState::simple()), // Important
             ..Default::default()
         });
         ci.subpass = Some(subpass.into());
@@ -2015,7 +2040,19 @@ fn window_size_dependent_setup(
         ci.vertex_input_state = Some(vertex_input_state);
         ci.input_assembly_state = Some(InputAssemblyState::default());
         ci.viewport_state = Some(ViewportState::default());
-        ci.rasterization_state = Some(RasterizationState::default());
+        ci.rasterization_state = Some(RasterizationState {
+            depth_clamp_enable: false,
+            rasterizer_discard_enable: false,
+            polygon_mode: Default::default(),
+            cull_mode: CullMode::Back,
+            front_face: FrontFace::CounterClockwise,
+            depth_bias: None,
+            line_width: 1.0,
+            line_rasterization_mode: Default::default(),
+            line_stipple: None,
+            conservative: None,
+            ..Default::default()
+        });
         ci.color_blend_state = Some(ColorBlendState {
             attachments: vec![
                 ColorBlendAttachmentState::default(),

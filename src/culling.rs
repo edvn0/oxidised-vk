@@ -1,32 +1,20 @@
-use crate::{FrustumPlanes, TransformTRS};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
-use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, DrawIndexedIndirectCommand,
-    PrimaryAutoCommandBuffer,
-};
-use vulkano::descriptor_set::DescriptorSet;
-use vulkano::device::{DeviceOwned, Queue};
-use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::layout::PushConstantRange;
-use vulkano::pipeline::{PipelineBindPoint, PipelineShaderStageCreateInfo};
-use vulkano::sync::GpuFuture;
+use vulkano::pipeline::PipelineShaderStageCreateInfo;
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     descriptor_set::layout::{
         DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
-    },
-    descriptor_set::{WriteDescriptorSet, allocator::StandardDescriptorSetAllocator},
-    device::Device,
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    }
+    ,
+    device::Device
+    ,
     pipeline::{
-        ComputePipeline, Pipeline, PipelineLayout, compute::ComputePipelineCreateInfo,
-        layout::PipelineLayoutCreateInfo,
+        compute::ComputePipelineCreateInfo, layout::PipelineLayoutCreateInfo, ComputePipeline,
+        PipelineLayout,
     },
-    shader::ShaderStages,
-    sync,
+    shader::ShaderStages
+    ,
 };
 
 pub struct CullPass {
@@ -189,144 +177,4 @@ pub fn construct_culling_passes(device: &Arc<Device>) -> (CullPass, PrefixPass) 
     };
 
     (cull_pass, prefix_pass)
-}
-
-impl CullPass {
-    pub fn execute(
-        &self,
-        cb_allocator: &Arc<StandardCommandBufferAllocator>,
-        queue: &Arc<Queue>,
-        allocator: &Arc<StandardDescriptorSetAllocator>,
-        transforms: Subbuffer<[TransformTRS]>,
-        visibility: Subbuffer<[u32]>,
-        frustum: Subbuffer<FrustumPlanes>,
-    ) -> Box<dyn GpuFuture> {
-        let count = transforms.len() as u32;
-
-        if count == 0 {
-            return sync::now(queue.device().clone()).boxed();
-        }
-
-        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
-            cb_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        let set = DescriptorSet::new(
-            allocator.clone(),
-            self.set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, transforms),
-                WriteDescriptorSet::buffer(1, visibility),
-                WriteDescriptorSet::buffer(2, frustum),
-            ],
-            [],
-        )
-        .unwrap();
-
-        let groups = (count + 255) / 256;
-
-        unsafe {
-            command_buffer_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Cull compute".to_string(),
-                    color: [0.1, 0.2, 0.8, 1.0],
-                    ..Default::default()
-                })
-                .unwrap();
-
-            command_buffer_builder
-                .bind_pipeline_compute(self.pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    self.pipeline.layout().clone(),
-                    0,
-                    set,
-                )
-                .unwrap()
-                .dispatch([groups, 1, 1])
-                .unwrap();
-            command_buffer_builder.end_debug_utils_label().unwrap();
-        }
-
-        let command_buffer = command_buffer_builder.build().unwrap();
-        sync::now(queue.device().clone())
-            .then_execute(queue.clone(), command_buffer)
-            .unwrap()
-            .boxed()
-    }
-}
-
-impl PrefixPass {
-    pub fn execute(
-        &self,
-        cb_allocator: &Arc<StandardCommandBufferAllocator>,
-        queue: &Arc<Queue>,
-        allocator: &Arc<StandardDescriptorSetAllocator>,
-        visibility: Subbuffer<[u32]>,
-        indirect: Subbuffer<[DrawIndexedIndirectCommand]>,
-        mesh_offsets: Subbuffer<[u32]>,
-        mesh_count: u32,
-    ) -> Box<dyn GpuFuture> {
-        let count = visibility.len() as u32;
-
-        if count == 0 {
-            return sync::now(queue.device().clone()).boxed();
-        }
-
-        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
-            cb_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        let set = DescriptorSet::new(
-            allocator.clone(),
-            self.set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, visibility),
-                WriteDescriptorSet::buffer(1, indirect),
-                WriteDescriptorSet::buffer(2, mesh_offsets),
-            ],
-            [],
-        )
-        .unwrap();
-
-        let groups = (count + 255) / 256;
-
-        unsafe {
-            command_buffer_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Prefix-sum post culling".to_string(),
-                    color: [0.1, 0.9, 0.8, 1.0],
-                    ..Default::default()
-                })
-                .unwrap();
-            command_buffer_builder
-                .bind_pipeline_compute(self.pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    self.pipeline.layout().clone(),
-                    0,
-                    set,
-                )
-                .unwrap()
-                .push_constants(self.pipeline.layout().clone(), 0, mesh_count)
-                .unwrap()
-                .dispatch([groups, 1, 1])
-                .unwrap();
-            command_buffer_builder.end_debug_utils_label().unwrap();
-        }
-
-        let command_buffer = command_buffer_builder.build().unwrap();
-        sync::now(queue.device().clone())
-            .then_execute(queue.clone(), command_buffer)
-            .unwrap()
-            .boxed()
-    }
 }
