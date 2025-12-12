@@ -8,7 +8,9 @@ use meshopt_rs::{
     vertex::{cache::optimize_vertex_cache, fetch::optimize_vertex_fetch},
 };
 use nalgebra::{Matrix4, Vector3, Vector4};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fs;
+use std::sync::{Arc, RwLock};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -21,6 +23,7 @@ use vulkano::{
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     sync::GpuFuture,
 };
+use crate::mesh_registry::MeshRegistry;
 
 #[derive(Debug)]
 pub enum MeshLoadError {
@@ -63,6 +66,7 @@ pub struct GpuMaterial {
     pub _pad2: u32,
 }
 
+#[derive(Eq, Hash, PartialEq)]
 pub struct MeshAsset {
     pub vertex_buffer: Subbuffer<[StandardMeshVertex]>,
     pub position_vertex_buffer: Subbuffer<[PositionMeshVertex]>,
@@ -81,14 +85,14 @@ impl MeshAsset {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubmeshGpu {
     pub first_index: u32,
     pub index_count: u32,
     pub material_index: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeshLod {
     pub first_index: u32,
     pub index_count: u32,
@@ -226,10 +230,22 @@ pub fn upload_build_mesh(
         [v[0], v[1], v[2], w]
     }
 
-    let gpu_materials = build
-        .materials
-        .iter()
-        .map(|m| GpuMaterial {
+    let mut gpu_materials = Vec::with_capacity(build.materials.len().max(1));
+
+    if build.materials.is_empty() {
+        gpu_materials.push(GpuMaterial {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 1.0,
+            base_color_tex: NON_DEFAULT_TEXTURE_WHITE,
+            normal_tex: NON_DEFAULT_TEXTURE_WHITE,
+            metallic_roughness_tex: NON_DEFAULT_TEXTURE_WHITE,
+            ao_tex: NON_DEFAULT_TEXTURE_WHITE,
+            flags: 0,
+            ..Default::default()
+        });
+    } else {
+        gpu_materials.extend(build.materials.iter().map(|m| GpuMaterial {
             base_color: extend3(m.base_color, 1.0),
             metallic: m.metallic,
             roughness: m.roughness,
@@ -239,8 +255,8 @@ pub fn upload_build_mesh(
             ao_tex: m.ao_tex.raw(),
             flags: m.flags,
             ..Default::default()
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
 
     let materials_buffer = Buffer::from_iter(
         allocator.clone(),
@@ -461,6 +477,60 @@ pub fn generate_lods_meshopt(
     }
 
     lods
+}
+
+pub fn load_meshes_from_directory(
+    dir: &str,
+    allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    graphics_queue: &Arc<Queue>,
+    white_tex: &Arc<ImageView>,
+) -> Arc<RwLock<MeshRegistry>> {
+    let mut meshes = HashMap::new();
+
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("gltf") | Some("glb")) {
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+
+        let path_str = path.to_str().unwrap();
+
+        let (build, images) = import_gltf(
+            path_str,
+            allocator,
+            command_buffer_allocator,
+            graphics_queue,
+            white_tex,
+            false,
+        )
+            .unwrap();
+
+        let mesh = upload_build_mesh(build, images, allocator).unwrap();
+
+        meshes.insert(name, mesh);
+    }
+
+    Arc::new(RwLock::new(MeshRegistry::new(meshes)))
 }
 
 fn process_node(

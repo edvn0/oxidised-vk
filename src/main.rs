@@ -8,12 +8,13 @@ mod mesh;
 mod shader_bindings;
 mod texture_cache;
 mod vertex;
+mod mesh_registry;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
-use crate::mesh::{MeshAsset, import_gltf, upload_build_mesh};
+use crate::mesh::{MeshAsset, import_gltf, upload_build_mesh, load_meshes_from_directory};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use nalgebra::{Matrix4, Translation3};
@@ -22,6 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
+use std::sync::RwLock;
 use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
@@ -94,6 +96,7 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+use crate::mesh_registry::MeshRegistry;
 
 const INSTANCE_COUNT: DeviceSize = 200;
 
@@ -102,6 +105,12 @@ fn main() -> Result<(), impl Error> {
     let mut app = App::new(&event_loop).unwrap();
 
     event_loop.run_app(&mut app)
+}
+
+struct MeshDrawStream {
+    mesh: Arc<MeshAsset>,
+    indirect: Subbuffer<[DrawIndexedIndirectCommand]>,
+    material_ids: Subbuffer<[u32]>,
 }
 
 struct App {
@@ -159,10 +168,23 @@ pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
 
+struct DrawSubmission {
+    mesh: Arc<MeshAsset>,
+    transform: TransformTRS,
+    override_material: Option<u32>,
+}
+
+struct MeshDraw {
+    mesh: Arc<MeshAsset>,
+    first_instance: u32,
+    instance_count: u32,
+}
+
 struct FrameSubmission {
-    transforms: Vec<TransformTRS>,
-    material_ids: Vec<u32>,
-    mesh_offsets: Vec<u32>,
+    draws: Vec<DrawSubmission>,    // intent
+    transforms: Vec<TransformTRS>, // packed
+    material_ids: Vec<u32>,        // packed
+    mesh_draws: Vec<MeshDraw>,     // executable
 }
 
 struct RenderContext {
@@ -176,12 +198,11 @@ struct RenderContext {
     start_time: Instant,
     elapsed_millis: u64,
 
-    meshes: HashMap<String, Arc<MeshAsset>>,
+    meshes: Arc<RwLock<MeshRegistry>>,
+    mesh_streams: HashMap<Arc<MeshAsset>, MeshDrawStream>,
 
     frame_transforms: Vec<Subbuffer<[TransformTRS]>>, // TODO: Move
     static_transforms: Vec<TransformTRS>,
-    material_id_buffers: Vec<Subbuffer<[u32]>>,
-    indirect_buffers: Vec<Subbuffer<[DrawIndexedIndirectCommand]>>,
     white_image_sampler: Arc<ImageView>,
     black_image_sampler: Arc<ImageView>,
 
@@ -392,25 +413,6 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
     transforms
 }
 
-fn calculate_submission_requirements(
-    meshes: &HashMap<String, Arc<MeshAsset>>,
-    instance_count: usize,
-) -> (usize, usize, usize) {
-    let mut total_submeshes = 0;
-    let mut total_submesh_lods = 0;
-
-    for mesh in meshes.values() {
-        total_submeshes += mesh.submeshes.len();
-        total_submesh_lods += mesh.submeshes.len() * mesh.lods.len();
-    }
-
-    let transforms = instance_count;
-    let material_ids = total_submeshes * instance_count;
-    let mesh_offsets = total_submesh_lods + 1;
-
-    (transforms, material_ids, mesh_offsets)
-}
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attribs = Window::default_attributes();
@@ -495,21 +497,70 @@ impl ApplicationHandler for App {
             0x00,
         );
 
-        let (built_asset, image_array) = import_gltf(
-            "assets/viking_room.glb",
+        let mesh_registry = load_meshes_from_directory(
+            "assets/meshes",
             &self.memory_allocator,
             &self.command_buffer_allocator,
             &self.graphics_queue,
             &white_tex,
-            false,
-        )
-        .unwrap();
+        );
 
-        let meshes = HashMap::from_iter([(
-            "viking_room".to_string(),
-            upload_build_mesh(built_asset, image_array, &self.memory_allocator).unwrap(),
-        )]);
-        let (t, m, o) = calculate_submission_requirements(&meshes, INSTANCE_COUNT as usize);
+        let mut mesh_streams = HashMap::new();
+
+        let meshes = mesh_registry.read().unwrap();
+        for (_name, mesh) in meshes.iter() {
+            let draw_count = mesh.lods.len() * mesh.submeshes.len();
+
+            let indirect = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.submeshes.iter().map(|sub| DrawIndexedIndirectCommand {
+                    index_count: sub.index_count,
+                    instance_count: 0,
+                    first_index: sub.first_index,
+                    vertex_offset: 0,
+                    first_instance: 0,
+                }),
+            )
+                .unwrap();
+
+            let material_ids = Buffer::new_slice::<u32>(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                draw_count as DeviceSize,
+            )
+                .unwrap();
+
+            {
+                let mut w = material_ids.write().unwrap();
+                update_material_ids_for_mesh(mesh, &mut w);
+            }
+
+            mesh_streams.insert(
+                mesh.clone(),
+                MeshDrawStream {
+                    mesh: mesh.clone(),
+                    indirect,
+                    material_ids,
+                },
+            );
+        }
 
         let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
             window_size_dependent_setup(
@@ -575,62 +626,6 @@ impl ApplicationHandler for App {
             })
             .collect::<Vec<_>>();
 
-        let asset = &meshes["viking_room"];
-        let lod = self.lod_choice;
-        let draw_template = asset
-            .submeshes
-            .iter()
-            .map(|sub| DrawIndexedIndirectCommand {
-                index_count: sub.index_count,
-                instance_count: 0,
-                first_index: asset.lods[lod].first_index + sub.first_index,
-                vertex_offset: asset.lods[lod].vertex_offset as u32,
-                first_instance: 0,
-            })
-            .collect::<Vec<_>>();
-
-        let indirect_buffers = (0..image_count)
-            .map(|_| {
-                Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::INDIRECT_BUFFER
-                            | BufferUsage::STORAGE_BUFFER
-                            | BufferUsage::TRANSFER_DST,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    draw_template.clone(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        let draw_count = meshes["viking_room"].lods.len() * meshes["viking_room"].submeshes.len();
-
-        let material_id_buffers = (0..image_count)
-            .map(|_| {
-                Buffer::new_slice::<u32>(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    draw_count as DeviceSize,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-
         let _shadow_map_sampler = Sampler::new(
             self.device.clone(),
             SamplerCreateInfo {
@@ -653,13 +648,6 @@ impl ApplicationHandler for App {
 
         let static_transforms = generate_random_transforms(INSTANCE_COUNT);
 
-        for ssbo in frame_transforms.iter() {
-            if let Ok(mut write) = ssbo.write() {
-                let len = write.len().min(static_transforms.len());
-                write[..len].copy_from_slice(&static_transforms[..len]);
-            }
-        }
-
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -678,8 +666,6 @@ impl ApplicationHandler for App {
             default_sampler,
             frame_transforms,
             static_transforms,
-            material_id_buffers,
-            indirect_buffers,
             white_image_sampler: white_tex,
             black_image_sampler: black_tex,
             frame_uniform_buffers: uniform_buffers,
@@ -689,11 +675,13 @@ impl ApplicationHandler for App {
             bloom_pass,
 
             frame_submission: FrameSubmission {
-                transforms: Vec::with_capacity(t),
-                material_ids: Vec::with_capacity(m),
-                mesh_offsets: vec![0; o],
+                transforms: vec![],
+                material_ids: vec![],
+                mesh_draws: vec![],
+                draws: vec![],
             },
-            meshes,
+            mesh_registry,
+            mesh_streams,
         });
     }
 
@@ -838,57 +826,25 @@ fn create_image(
 }
 
 impl RenderContext {
-    fn draw_mesh(
-        &mut self,
-        asset: &MeshAsset,
-        lod: usize,
-        transform: TransformTRS,
-        override_material: Option<u32>,
-    ) {
-        debug_assert!(lod < asset.lods.len());
-        debug_assert!(self.frame_submission.transforms.len() <= INSTANCE_COUNT as usize);
-
-        let frame = &mut self.frame_submission;
-
-        let object_index = frame.transforms.len() as u32;
-        debug_assert!(object_index < INSTANCE_COUNT as u32);
-
-        frame.transforms.push(transform);
-
-        let submesh_count = asset.submeshes.len();
-        let base_draw_index = lod * submesh_count;
-
-        for (submesh_index, submesh) in asset.submeshes.iter().enumerate() {
-            let mat = override_material.unwrap_or(submesh.material_index);
-            frame.material_ids.push(mat);
-
-            let draw_index = base_draw_index + submesh_index;
-            frame.mesh_offsets[draw_index + 1] += 1;
-        }
+    fn draw_mesh(&mut self, mesh: Arc<MeshAsset>, transform: TransformTRS, material: Option<u32>) {
+        self.frame_submission.draws.push(DrawSubmission {
+            mesh,
+            transform,
+            override_material: material,
+        });
     }
 }
 
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
-        rcx.frame_submission.transforms.clear();
-        rcx.frame_submission.material_ids.clear();
-        rcx.frame_submission.mesh_offsets.fill(0);
+        rcx.frame_submission.draws.clear();
 
-        let mesh = rcx.meshes.get("viking_room").unwrap().clone(); // or reference if Cheap
-        let lod = self.lod_choice;
         for t in rcx.static_transforms.clone() {
-            rcx.draw_mesh(&mesh, lod, t, None);
+            rcx.draw_mesh(rcx.meshes["viking_room"].clone(), t, None);
         }
 
-        let offsets = &mut rcx.frame_submission.mesh_offsets;
-
-        let mut acc = 0u32;
-        for i in 0..offsets.len() {
-            let v = offsets[i];
-            offsets[i] = acc;
-            acc += v;
-        }
+        rcx.build_frame();
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -952,6 +908,15 @@ impl App {
 
         acquire_future.wait(None).unwrap();
 
+        let required_instances = rcx.frame_submission.transforms.len();
+
+        rcx.ensure_frame_buffer_capacity(
+            image_index as usize,
+            required_instances,
+            &self.memory_allocator,
+        );
+
+
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
@@ -963,61 +928,26 @@ impl App {
 
         rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
 
-        let transforms = rcx.frame_transforms[image_index as usize].clone();
-        let material_ids = rcx.material_id_buffers[image_index as usize].clone();
-
         {
-            /* === TRANSFORMS === */
+            let transforms = rcx.frame_transforms[image_index as usize].clone();
+
             if let Ok(mut w) = transforms.write() {
-                let n = rcx.frame_submission.transforms.len().min(w.len());
-                w[..n].copy_from_slice(&rcx.frame_submission.transforms[..n]);
+                w[..required_instances]
+                    .copy_from_slice(&rcx.frame_submission.transforms);
             }
 
-            if let Ok(mut w) = material_ids.write() {
-                let mesh = &rcx.meshes["viking_room"];
-                let lod_count = mesh.lods.len();
-
-                let mut draw_id = 0;
-
-                for _ in 0..lod_count {
-                    for sub in &mesh.submeshes {
-                        w[draw_id] = sub.material_index;
-                        draw_id += 1;
+            for draw in &rcx.frame_submission.mesh_draws {
+                let stream = rcx.mesh_streams.get(&draw.mesh).unwrap();
+                if let Ok(mut cmds) = stream.indirect.write() {
+                    for cmd in cmds.iter_mut() {
+                        cmd.first_instance = draw.first_instance;
+                        cmd.instance_count = draw.instance_count;
                     }
-                }
-            }
-
-            let indirect = rcx.indirect_buffers[image_index as usize].clone();
-            let total_instances = rcx.frame_submission.transforms.len() as u32;
-
-            if let Ok(mut cmds) = indirect.write() {
-                for cmd in cmds.iter_mut() {
-                    cmd.first_instance = 0;
-                    cmd.instance_count = total_instances;
                 }
             }
         }
 
         {
-            // Pre-Depth instanced pass
-            let set = DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                rcx.mrt_pass.predepth_pipeline.layout().set_layouts()[1].clone(),
-                [WriteDescriptorSet::buffer(
-                    1,
-                    rcx.frame_transforms[image_index as usize].clone(),
-                )],
-                [],
-            )
-            .unwrap();
-
-            let sets = [
-                rcx.context_descriptor_set
-                    .for_frame(image_index as usize)
-                    .clone(),
-                set,
-            ];
-
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
                     label_name: "Predepth Z".to_string(),
@@ -1028,7 +958,7 @@ impl App {
                 .begin_rendering(RenderingInfo {
                     render_area_extent: rcx.scissor.extent,
                     render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![], // No MRT!
+                    color_attachments: vec![],
                     depth_attachment: Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
@@ -1068,18 +998,46 @@ impl App {
                     PipelineBindPoint::Graphics,
                     rcx.mrt_pass.predepth_pipeline.layout().clone(),
                     0,
-                    sets.to_vec(),
+                    [rcx.context_descriptor_set
+                        .for_frame(image_index as usize)
+                        .clone()]
+                    .to_vec(),
                 )
-                .unwrap()
-                .bind_vertex_buffers(0, rcx.meshes["viking_room"].position_vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(rcx.meshes["viking_room"].index_buffer.clone())
                 .unwrap();
 
-            unsafe {
+            let layout = rcx.mrt_pass.predepth_pipeline.layout().set_layouts()[1].clone();
+
+            for stream in rcx.mesh_streams.values() {
+                let set_1 = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    layout.clone(),
+                    [WriteDescriptorSet::buffer(1, rcx.frame_transforms[image_index as usize].clone())
+                    ],
+                    [],
+                )
+                .unwrap();
+
                 graphics_builder
-                    .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.mrt_pass.predepth_pipeline.layout().clone(),
+                        1,
+                        [set_1].to_vec(),
+                    )
+                    .unwrap()
+                    .bind_vertex_buffers(0, stream.mesh.position_vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(stream.mesh.index_buffer.clone())
                     .unwrap();
+
+                unsafe {
+                    graphics_builder
+                        .draw_indexed_indirect(stream.indirect.clone())
+                        .unwrap();
+                }
+            }
+
+            unsafe {
                 graphics_builder
                     .end_rendering()
                     .unwrap()
@@ -1095,48 +1053,6 @@ impl App {
                 .layout()
                 .set_layouts()[1]
                 .clone();
-
-            let set = DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                layout,
-                [
-                    WriteDescriptorSet::image_view_sampler_array(
-                        0,
-                        0,
-                        rcx.meshes["viking_room"]
-                            .texture_array
-                            .iter()
-                            .cloned()
-                            .map(|v| (v, rcx.default_sampler.clone()))
-                            .chain(std::iter::repeat((
-                                rcx.white_image_sampler.clone(),
-                                rcx.default_sampler.clone(),
-                            )))
-                            .take(256),
-                    ),
-                    WriteDescriptorSet::buffer(
-                        1,
-                        rcx.frame_transforms[image_index as usize].clone(),
-                    ),
-                    WriteDescriptorSet::buffer(
-                        2,
-                        rcx.material_id_buffers[image_index as usize].clone(),
-                    ),
-                    WriteDescriptorSet::buffer(
-                        3,
-                        rcx.meshes["viking_room"].materials_buffer.clone(),
-                    ),
-                ],
-                [],
-            )
-            .unwrap();
-
-            let sets = [
-                rcx.context_descriptor_set
-                    .for_frame(image_index as usize)
-                    .clone(),
-                set,
-            ];
 
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
@@ -1213,18 +1129,69 @@ impl App {
                     PipelineBindPoint::Graphics,
                     rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
                     0,
-                    sets.to_vec(),
+                    [rcx.context_descriptor_set
+                        .for_frame(image_index as usize)
+                        .clone()]
+                    .to_vec(),
                 )
-                .unwrap()
-                .bind_vertex_buffers(0, rcx.meshes["viking_room"].vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(rcx.meshes["viking_room"].index_buffer.clone())
                 .unwrap();
 
-            unsafe {
+            let layout = rcx
+                .mrt_pass
+                .gbuffer_instanced_pipeline
+                .layout()
+                .set_layouts()[1]
+                .clone();
+
+            for stream in rcx.mesh_streams.values() {
+                let set_1 = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    layout.clone(),
+                    [
+                        WriteDescriptorSet::image_view_sampler_array(
+                            0,
+                            0,
+                            stream
+                                .mesh
+                                .texture_array
+                                .iter()
+                                .cloned()
+                                .map(|v| (v, rcx.default_sampler.clone()))
+                                .chain(std::iter::repeat((
+                                    rcx.white_image_sampler.clone(),
+                                    rcx.default_sampler.clone(),
+                                )))
+                                .take(256),
+                        ),
+                        WriteDescriptorSet::buffer(1, rcx.frame_transforms[image_index as usize].clone()),
+                        WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
+                        WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
+                    ],
+                    [],
+                )
+                .unwrap();
+
                 graphics_builder
-                    .draw_indexed_indirect(rcx.indirect_buffers[image_index as usize].clone())
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
+                        1,
+                        [set_1].to_vec(),
+                    )
+                    .unwrap()
+                    .bind_vertex_buffers(0, stream.mesh.vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(stream.mesh.index_buffer.clone())
                     .unwrap();
+
+                unsafe {
+                    graphics_builder
+                        .draw_indexed_indirect(stream.indirect.clone())
+                        .unwrap();
+                }
+            }
+
+            unsafe {
                 graphics_builder
                     .end_rendering()
                     .unwrap()
@@ -1414,6 +1381,73 @@ impl App {
         }
 
         self.input_state.end_frame();
+    }
+}
+
+impl RenderContext {
+    fn build_frame(&mut self) {
+        let submission = &mut self.frame_submission;
+
+        submission.mesh_draws.clear();
+        submission.transforms.clear();
+        submission.material_ids.clear();
+
+        let mut buckets: HashMap<Arc<MeshAsset>, Vec<&DrawSubmission>> = HashMap::new();
+
+        for draw in &submission.draws {
+            buckets.entry(draw.mesh.clone()).or_default().push(draw);
+        }
+
+        let mut base_instance = 0u32;
+
+        for (mesh, draws) in buckets {
+            let first_instance = base_instance;
+
+            for d in &draws {
+                submission.transforms.push(d.transform);
+            }
+
+            let instance_count = draws.len() as u32;
+
+            submission.mesh_draws.push(MeshDraw {
+                mesh: mesh.clone(),
+                first_instance,
+                instance_count,
+            });
+
+            base_instance += instance_count;
+        }
+    }
+
+    fn ensure_frame_buffer_capacity(
+        &mut self,
+        image_index: usize,
+        required_instances: usize,
+        allocator: &Arc<StandardMemoryAllocator>,
+    ) {
+        /* === TRANSFORMS === */
+        {
+            let current = self.frame_transforms[image_index].len() as usize;
+
+            if current < required_instances {
+                let new_capacity = required_instances.next_power_of_two();
+
+                self.frame_transforms[image_index] = Buffer::new_slice::<TransformTRS>(
+                    allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        ..Default::default()
+                    },
+                    new_capacity as DeviceSize,
+                )
+                .unwrap();
+            }
+        }
     }
 }
 
@@ -2208,4 +2242,18 @@ fn window_size_dependent_setup(
     // let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
 
     (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass)
+}
+
+fn update_material_ids_for_mesh(
+    mesh: &MeshAsset,
+    material_ids: &mut [u32],
+) {
+    let mut draw_id = 0;
+
+    for _lod in 0..mesh.lods.len() {
+        for sub in &mesh.submeshes {
+            material_ids[draw_id] = sub.material_index;
+            draw_id += 1;
+        }
+    }
 }

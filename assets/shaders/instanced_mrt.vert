@@ -30,8 +30,7 @@ layout(set = 1, binding = 2, std430) readonly buffer MaterialIds {
 
 void main() {
     uint draw_id = gl_DrawID;
-    uint object_index = gl_InstanceIndex - gl_BaseInstance;
-    debugPrintfEXT("Instance: %d, Object index %d, DrawID: %d",gl_InstanceIndex, object_index, draw_id);
+    uint object_index = gl_InstanceIndex;
 
     uint material_index = material_ids[draw_id];
 
