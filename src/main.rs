@@ -1,21 +1,24 @@
 extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
-mod culling;
 mod input_state;
 mod main_helpers;
 mod math;
+mod mesh;
 mod shader_bindings;
+mod texture_cache;
+mod vertex;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
-use crate::culling::{CullPass, PrefixPass, construct_culling_passes};
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
+use crate::mesh::{MeshAsset, import_gltf, upload_build_mesh};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
-use nalgebra::{Matrix4, Translation3, Vector3};
+use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
+use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
@@ -23,6 +26,7 @@ use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
+use vulkano::device::DeviceOwned;
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
@@ -34,9 +38,8 @@ use vulkano::instance::InstanceExtensions;
 use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace};
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexInputState};
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::sync::semaphore::{Semaphore, SemaphoreCreateInfo, SemaphoreType};
 use vulkano::{
     DeviceSize, Validated, Version, VulkanError, VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -70,7 +73,7 @@ use vulkano::{
             multisample::MultisampleState,
             rasterization::RasterizationState,
             subpass::PipelineRenderingCreateInfo,
-            vertex_input::{Vertex, VertexDefinition},
+            vertex_input::VertexDefinition,
             viewport::{Scissor, Viewport, ViewportState},
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
@@ -92,17 +95,13 @@ use winit::{
     window::{Window, WindowId},
 };
 
+const INSTANCE_COUNT: DeviceSize = 200;
+
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop).unwrap();
 
     event_loop.run_app(&mut app)
-}
-
-#[repr(C)]
-#[derive(BufferContents)]
-struct PushConsts {
-    model: [f32; 16],
 }
 
 struct App {
@@ -113,19 +112,20 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    vertex_buffer: Subbuffer<[MyVertex]>,
-    index_buffer: Subbuffer<[u32]>,
     rcx: Option<RenderContext>,
 
     input_state: InputState,
     camera: Camera,
     last_frame: Instant,
+
+    cull_backfaces: bool,
+    clockwise_front_face: bool,
+    lod_choice: usize,
 }
 struct MRT {
     predepth_pipeline: Arc<GraphicsPipeline>,
     gbuffer_image_views: [Arc<ImageView>; 3],
     gbuffer_depth_view: Arc<ImageView>,
-    gbuffer_pipeline: Arc<GraphicsPipeline>,
     gbuffer_instanced_pipeline: Arc<GraphicsPipeline>,
 }
 
@@ -159,6 +159,12 @@ pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
 
+struct FrameSubmission {
+    transforms: Vec<TransformTRS>,
+    material_ids: Vec<u32>,
+    mesh_offsets: Vec<u32>,
+}
+
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
@@ -170,24 +176,25 @@ struct RenderContext {
     start_time: Instant,
     elapsed_millis: u64,
 
+    meshes: HashMap<String, Arc<MeshAsset>>,
+
     frame_transforms: Vec<Subbuffer<[TransformTRS]>>, // TODO: Move
+    static_transforms: Vec<TransformTRS>,
+    material_id_buffers: Vec<Subbuffer<[u32]>>,
     indirect_buffers: Vec<Subbuffer<[DrawIndexedIndirectCommand]>>,
-    visibility_buffers: Vec<Subbuffer<[u32]>>,
-    mesh_offsets_buffers: Vec<Subbuffer<[u32]>>,
     white_image_sampler: Arc<ImageView>,
     black_image_sampler: Arc<ImageView>,
 
     context_descriptor_set: FrameDescriptorSet,
     frame_uniform_buffers: Vec<Subbuffer<RendererUBO>>,
-    frustum_buffers: Vec<Subbuffer<FrustumPlanes>>,
+
+    frame_submission: FrameSubmission,
 
     mrt_pass: MRT,
     mrt_lighting: MRTLighting,
     composite: Composite,
     swapchain_pass: SwapchainPass,
     bloom_pass: BloomPass,
-    cull_pass: CullPass,
-    prefix_pass: PrefixPass,
 }
 
 impl RenderContext {
@@ -310,6 +317,9 @@ impl App {
                 enabled_features: DeviceFeatures {
                     dynamic_rendering: true,
                     timeline_semaphore: true,
+                    shader_draw_parameters: true,
+                    multi_draw_indirect: true,
+                    buffer_device_address: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -335,82 +345,6 @@ impl App {
             Default::default(),
         ));
 
-        let (models, _materials) = tobj::load_obj(
-            "assets/torus_knot.obj",
-            &tobj::LoadOptions {
-                triangulate: true,
-                single_index: true,
-                ..Default::default()
-            },
-        )?;
-
-        let mesh = &models[0].mesh;
-
-        let mut vertices = Vec::with_capacity(mesh.indices.len());
-        let mut indices = Vec::with_capacity(mesh.indices.len());
-
-        for face_index in mesh.indices.iter() {
-            let i = *face_index as usize;
-
-            let px = mesh.positions[i * 3 + 0];
-            let py = mesh.positions[i * 3 + 1];
-            let pz = mesh.positions[i * 3 + 2];
-
-            let (nx, ny, nz) = if !mesh.normals.is_empty() {
-                (
-                    mesh.normals[i * 3 + 0],
-                    mesh.normals[i * 3 + 1],
-                    mesh.normals[i * 3 + 2],
-                )
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-
-            let (ux, uy) = if !mesh.texcoords.is_empty() {
-                (mesh.texcoords[i * 2 + 0], mesh.texcoords[i * 2 + 1])
-            } else {
-                (0.0, 0.0)
-            };
-
-            indices.push(vertices.len() as u32);
-
-            vertices.push(MyVertex {
-                position: [px, py, pz],
-                normal: [nx, ny, nz],
-                uvs: [ux, uy],
-            });
-        }
-
-        let vertex_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            vertices,
-        )
-        .unwrap();
-
-        let index_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            indices,
-        )
-        .unwrap();
-
         Ok(App {
             instance,
             device,
@@ -419,19 +353,20 @@ impl App {
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
-            vertex_buffer,
-            index_buffer,
             input_state: InputState::new(),
             camera: Camera::new(),
             last_frame: Instant::now(),
             rcx: None,
+            cull_backfaces: true,
+            clockwise_front_face: true,
+            lod_choice: 0,
         })
     }
 }
 
-fn generate_random_transforms(count: usize) -> Vec<TransformTRS> {
+fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
     let mut rng = rand::rng();
-    let mut transforms = Vec::with_capacity(count);
+    let mut transforms = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
         let x = rng.random_range(-50.0..50.0);
@@ -444,7 +379,7 @@ fn generate_random_transforms(count: usize) -> Vec<TransformTRS> {
         let rz = rng.random_range(0.0..std::f32::consts::TAU);
         let rotation = nalgebra::Rotation3::from_euler_angles(rx, ry, rz);
 
-        let scale = rng.random_range(0.1..0.5);
+        let scale = rng.random_range(1.0..5.0);
         let scale_matrix = Matrix4::new_scaling(scale);
 
         let transform = translation.to_homogeneous() * rotation.to_homogeneous() * scale_matrix;
@@ -455,6 +390,25 @@ fn generate_random_transforms(count: usize) -> Vec<TransformTRS> {
     }
 
     transforms
+}
+
+fn calculate_submission_requirements(
+    meshes: &HashMap<String, Arc<MeshAsset>>,
+    instance_count: usize,
+) -> (usize, usize, usize) {
+    let mut total_submeshes = 0;
+    let mut total_submesh_lods = 0;
+
+    for mesh in meshes.values() {
+        total_submeshes += mesh.submeshes.len();
+        total_submesh_lods += mesh.submeshes.len() * mesh.lods.len();
+    }
+
+    let transforms = instance_count;
+    let material_ids = total_submeshes * instance_count;
+    let mesh_offsets = total_submesh_lods + 1;
+
+    (transforms, material_ids, mesh_offsets)
 }
 
 impl ApplicationHandler for App {
@@ -480,8 +434,8 @@ impl ApplicationHandler for App {
 
             let image_format = formats
                 .iter()
-                .find(|(fmt, _)| fmt == &Format::B8G8R8A8_SRGB || fmt == &Format::R8G8B8A8_SRGB)
-                .map(|(fmt, _)| *fmt)
+                .map(|x| x.0)
+                .find(|fmt| *fmt == Format::B8G8R8A8_SRGB || *fmt == Format::R8G8B8A8_SRGB)
                 .unwrap_or(formats[0].0); // fallback if no srgb is available
 
             Swapchain::new(
@@ -528,7 +482,36 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull, prefix) =
+        let white_tex = create_image(
+            &self.graphics_queue,
+            &self.command_buffer_allocator,
+            &self.memory_allocator,
+            0xFF,
+        );
+        let black_tex = create_image(
+            &self.graphics_queue,
+            &self.command_buffer_allocator,
+            &self.memory_allocator,
+            0x00,
+        );
+
+        let (built_asset, image_array) = import_gltf(
+            "assets/viking_room.glb",
+            &self.memory_allocator,
+            &self.command_buffer_allocator,
+            &self.graphics_queue,
+            &white_tex,
+            false,
+        )
+        .unwrap();
+
+        let meshes = HashMap::from_iter([(
+            "viking_room".to_string(),
+            upload_build_mesh(built_asset, image_array, &self.memory_allocator).unwrap(),
+        )]);
+        let (t, m, o) = calculate_submission_requirements(&meshes, INSTANCE_COUNT as usize);
+
+        let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
             window_size_dependent_setup(
                 &self.device,
                 &self.memory_allocator,
@@ -540,7 +523,7 @@ impl ApplicationHandler for App {
         let viewport = Viewport {
             offset: [0.0, 0.0],
             extent: [window_size.width as f32, window_size.height as f32],
-            depth_range: 1.0..=0.0, // Use standard range with reverse-Z in shader
+            depth_range: 0.0..=1.0,
         };
 
         let scissor = Scissor {
@@ -571,26 +554,10 @@ impl ApplicationHandler for App {
             })
             .collect::<Vec<Subbuffer<RendererUBO>>>();
 
-        let frustum_ubos = (0..image_count)
+        let frame_transforms = (0..image_count)
             .map(|_| {
-                Buffer::new_sized::<FrustumPlanes>(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-            })
-            .collect::<Vec<Subbuffer<FrustumPlanes>>>();
+                let max_total_instances = INSTANCE_COUNT as usize;
 
-        let ssbos = (0..image_count)
-            .map(|_| {
                 Buffer::new_slice::<TransformTRS>(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
@@ -602,18 +569,34 @@ impl ApplicationHandler for App {
                             | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                         ..Default::default()
                     },
-                    10_000 * std::mem::size_of::<TransformTRS>() as DeviceSize,
+                    max_total_instances as DeviceSize,
                 )
                 .unwrap()
             })
-            .collect::<Vec<Subbuffer<[TransformTRS]>>>();
+            .collect::<Vec<_>>();
+
+        let asset = &meshes["viking_room"];
+        let lod = self.lod_choice;
+        let draw_template = asset
+            .submeshes
+            .iter()
+            .map(|sub| DrawIndexedIndirectCommand {
+                index_count: sub.index_count,
+                instance_count: 0,
+                first_index: asset.lods[lod].first_index + sub.first_index,
+                vertex_offset: asset.lods[lod].vertex_offset as u32,
+                first_instance: 0,
+            })
+            .collect::<Vec<_>>();
 
         let indirect_buffers = (0..image_count)
             .map(|_| {
                 Buffer::from_iter(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
-                        usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                        usage: BufferUsage::INDIRECT_BUFFER
+                            | BufferUsage::STORAGE_BUFFER
+                            | BufferUsage::TRANSFER_DST,
                         ..Default::default()
                     },
                     AllocationCreateInfo {
@@ -621,58 +604,32 @@ impl ApplicationHandler for App {
                             | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    vec![
-                        DrawIndexedIndirectCommand {
-                            index_count: 0,
-                            instance_count: 0,
-                            first_index: 0,
-                            vertex_offset: 0,
-                            first_instance: 0,
-                        };
-                        1
-                    ], // One command per mesh type
+                    draw_template.clone(),
                 )
                 .unwrap()
             })
             .collect::<Vec<_>>();
 
-        let visibility_buffers: Vec<_> = (0..image_count)
-            .map(|_| {
-                Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                        ..Default::default()
-                    },
-                    std::iter::repeat(0u32).take(10_000),
-                )
-                .unwrap()
-            })
-            .collect();
+        let draw_count = meshes["viking_room"].lods.len() * meshes["viking_room"].submeshes.len();
 
-        let mesh_offsets_buffers: Vec<_> = (0..image_count)
+        let material_id_buffers = (0..image_count)
             .map(|_| {
-                Buffer::from_iter(
+                Buffer::new_slice::<u32>(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER,
+                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
                         ..Default::default()
                     },
                     AllocationCreateInfo {
                         memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    [0u32, 10_000u32],
+                    draw_count as DeviceSize,
                 )
                 .unwrap()
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let _shadow_map_sampler = Sampler::new(
             self.device.clone(),
@@ -694,12 +651,12 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let random_transforms = generate_random_transforms(100_000);
+        let static_transforms = generate_random_transforms(INSTANCE_COUNT);
 
-        for ssbo in ssbos.iter() {
+        for ssbo in frame_transforms.iter() {
             if let Ok(mut write) = ssbo.write() {
-                let len = write.len().min(random_transforms.len());
-                write[..len].copy_from_slice(&random_transforms[..len]);
+                let len = write.len().min(static_transforms.len());
+                write[..len].copy_from_slice(&static_transforms[..len]);
             }
         }
 
@@ -719,30 +676,24 @@ impl ApplicationHandler for App {
                 &uniform_buffers,
             ),
             default_sampler,
-            frame_transforms: ssbos,
+            frame_transforms,
+            static_transforms,
+            material_id_buffers,
             indirect_buffers,
-            visibility_buffers,
-            mesh_offsets_buffers,
-            white_image_sampler: create_image(
-                &self.graphics_queue,
-                &self.command_buffer_allocator,
-                &self.memory_allocator,
-                0xFF,
-            ),
-            black_image_sampler: create_image(
-                &self.graphics_queue,
-                &self.command_buffer_allocator,
-                &self.memory_allocator,
-                0x00,
-            ),
+            white_image_sampler: white_tex,
+            black_image_sampler: black_tex,
             frame_uniform_buffers: uniform_buffers,
-            frustum_buffers: frustum_ubos,
             mrt_pass: mrt,
             mrt_lighting,
             composite,
             bloom_pass,
-            cull_pass: cull,
-            prefix_pass: prefix,
+
+            frame_submission: FrameSubmission {
+                transforms: Vec::with_capacity(t),
+                material_ids: Vec::with_capacity(m),
+                mesh_offsets: vec![0; o],
+            },
+            meshes,
         });
     }
 
@@ -756,6 +707,28 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::KeyboardInput { .. } => {
+                if let WindowEvent::KeyboardInput { event, .. } = &event
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyU) => {
+                            self.cull_backfaces = !self.cull_backfaces;
+                            println!("Culling: {:?}", self.cull_backfaces);
+                        }
+                        PhysicalKey::Code(KeyCode::KeyH) => {
+                            self.clockwise_front_face = !self.clockwise_front_face;
+                            println!("Winding: {:?}", self.clockwise_front_face);
+                        }
+                        PhysicalKey::Code(KeyCode::KeyY) => {
+                            let lod_count =
+                                self.rcx.as_ref().unwrap().meshes["viking_room"].lods.len();
+                            self.lod_choice = (self.lod_choice + 1) % lod_count;
+                            println!("LOD set to {}", self.lod_choice);
+                        }
+                        _ => {}
+                    }
+                }
                 if let WindowEvent::KeyboardInput { event, .. } = &event
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && event.state == ElementState::Pressed
@@ -827,6 +800,11 @@ fn create_image(
     )
     .unwrap();
 
+    allocator
+        .device()
+        .set_debug_utils_object_name(&img, Some("White Renderer Texture"))
+        .unwrap();
+
     {
         // Perform a clear to the specified value
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -859,9 +837,58 @@ fn create_image(
     ImageView::new_default(img.clone()).unwrap()
 }
 
+impl RenderContext {
+    fn draw_mesh(
+        &mut self,
+        asset: &MeshAsset,
+        lod: usize,
+        transform: TransformTRS,
+        override_material: Option<u32>,
+    ) {
+        debug_assert!(lod < asset.lods.len());
+        debug_assert!(self.frame_submission.transforms.len() <= INSTANCE_COUNT as usize);
+
+        let frame = &mut self.frame_submission;
+
+        let object_index = frame.transforms.len() as u32;
+        debug_assert!(object_index < INSTANCE_COUNT as u32);
+
+        frame.transforms.push(transform);
+
+        let submesh_count = asset.submeshes.len();
+        let base_draw_index = lod * submesh_count;
+
+        for (submesh_index, submesh) in asset.submeshes.iter().enumerate() {
+            let mat = override_material.unwrap_or(submesh.material_index);
+            frame.material_ids.push(mat);
+
+            let draw_index = base_draw_index + submesh_index;
+            frame.mesh_offsets[draw_index + 1] += 1;
+        }
+    }
+}
+
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
+        rcx.frame_submission.transforms.clear();
+        rcx.frame_submission.material_ids.clear();
+        rcx.frame_submission.mesh_offsets.fill(0);
+
+        let mesh = rcx.meshes.get("viking_room").unwrap().clone(); // or reference if Cheap
+        let lod = self.lod_choice;
+        for t in rcx.static_transforms.clone() {
+            rcx.draw_mesh(&mesh, lod, t, None);
+        }
+
+        let offsets = &mut rcx.frame_submission.mesh_offsets;
+
+        let mut acc = 0u32;
+        for i in 0..offsets.len() {
+            let v = offsets[i];
+            offsets[i] = acc;
+            acc += v;
+        }
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -889,7 +916,7 @@ impl App {
 
             rcx.swapchain = new_swapchain;
 
-            let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass, cull, prefix) =
+            let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
                 window_size_dependent_setup(
                     &self.device,
                     &self.memory_allocator,
@@ -902,8 +929,6 @@ impl App {
             rcx.mrt_lighting = mrt_lighting;
             rcx.composite = composite;
             rcx.bloom_pass = bloom_pass;
-            rcx.cull_pass = cull;
-            rcx.prefix_pass = prefix;
 
             rcx.viewport.extent = [window_size.width as f32, window_size.height as f32];
             rcx.scissor.extent = window_size.into();
@@ -929,226 +954,6 @@ impl App {
 
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
-        {
-            let ib = &rcx.indirect_buffers[image_index as usize];
-            if let Ok(mut d) = ib.write() {
-                for k in d.iter_mut() {
-                    k.index_count = self.index_buffer.len() as u32;
-                    k.instance_count = 0;
-                    k.first_index = 0;
-                    k.vertex_offset = 0;
-                    k.first_instance = 0;
-                }
-            }
-        }
-
-        {
-            let view = self.camera.view_matrix();
-            let proj = self.camera.projection_matrix(
-                rcx.window.inner_size().width as f32 / rcx.window.inner_size().height as f32,
-            );
-            let vp = proj * view;
-
-            let mut planes = [[0f32; 4]; 6];
-            let m = vp.as_slice();
-
-            // Left plane: clip.w + clip.x >= 0
-            planes[0] = [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]];
-
-            // Right plane: clip.w - clip.x >= 0
-            planes[1] = [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]];
-
-            // Bottom plane: clip.w + clip.y >= 0
-            planes[2] = [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]];
-
-            // Top plane: clip.w - clip.y >= 0
-            planes[3] = [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]];
-
-            // For REVERSE-Z where near=1.0, far=0.0:
-            // In clip space: z/w goes from 1.0 (near) to 0.0 (far)
-
-            // Near plane: clip.w - clip.z >= 0  (because z/w <= 1.0)
-            // This is: w - z >= 0, or equivalently: 1.0 - (z/w) >= 0
-            planes[4] = [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]];
-
-            // Far plane: clip.z >= 0  (because z/w >= 0.0)
-            // For INFINITE projection, this will be degenerate (0,0,0,d)
-            // We'll skip it in culling
-            planes[5] = [m[2], m[6], m[10], m[14]];
-
-            // Normalize all planes (CRITICAL: normal must have length 1)
-            fn normalize_plane(p: &mut [f32; 4]) -> bool {
-                let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-                if len > 1e-6 {
-                    // Avoid division by zero
-                    let inv_len = 1.0 / len;
-                    p[0] *= inv_len;
-                    p[1] *= inv_len;
-                    p[2] *= inv_len;
-                    p[3] *= inv_len;
-                    true
-                } else {
-                    // Degenerate plane - this is OK for infinite far plane
-                    false
-                }
-            }
-
-            let mut valid_planes = [true; 6];
-            for (i, p) in planes.iter_mut().enumerate() {
-                valid_planes[i] = normalize_plane(p);
-            }
-
-            // DEBUG: Verify near plane is not degenerate
-            #[cfg(debug_assertions)]
-            if rcx.elapsed_millis % 1000 < 16 {
-                let cam_pos = self.camera.position;
-                let cam_forward = self.camera.forward;
-                let test_point = cam_pos + cam_forward * 10.0;
-
-                println!("\n=== Frustum Debug ===");
-                println!("Camera pos: {:?}", cam_pos);
-                println!("Camera forward: {:?}", cam_forward);
-                println!("Test point (10 units forward): {:?}", test_point);
-
-                // Check if using infinite projection
-                let is_infinite =
-                    (m[2].abs() < 1e-6) && (m[6].abs() < 1e-6) && (m[10].abs() < 1e-6);
-                println!(
-                    "Projection type: {}",
-                    if is_infinite {
-                        "INFINITE reverse-Z"
-                    } else {
-                        "FINITE reverse-Z"
-                    }
-                );
-
-                for (i, plane) in planes.iter().enumerate() {
-                    if !valid_planes[i] {
-                        let name = match i {
-                            0 => "Left",
-                            1 => "Right",
-                            2 => "Bottom",
-                            3 => "Top",
-                            4 => "Near",
-                            5 => "Far",
-                            _ => "Unknown",
-                        };
-                        println!("{:7} plane: DEGENERATE (skipped in culling)", name);
-                        continue;
-                    }
-
-                    let dist = plane[0] * test_point.x
-                        + plane[1] * test_point.y
-                        + plane[2] * test_point.z
-                        + plane[3];
-                    let name = match i {
-                        0 => "Left",
-                        1 => "Right",
-                        2 => "Bottom",
-                        3 => "Top",
-                        4 => "Near",
-                        5 => "Far",
-                        _ => "Unknown",
-                    };
-                    let normal_len =
-                        (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
-                    println!(
-                        "{:7} plane: normal=({:7.3}, {:7.3}, {:7.3}) |N|={:.3} d={:7.3}, test_dist={:7.3}",
-                        name, plane[0], plane[1], plane[2], normal_len, plane[3], dist
-                    );
-                }
-
-                // Verify test point should be inside frustum
-                let mut all_inside = true;
-                for (i, plane) in planes.iter().enumerate() {
-                    if !valid_planes[i] {
-                        continue; // Skip degenerate planes
-                    }
-
-                    let dist = plane[0] * test_point.x
-                        + plane[1] * test_point.y
-                        + plane[2] * test_point.z
-                        + plane[3];
-                    if dist < 0.0 {
-                        all_inside = false;
-                        let name = match i {
-                            0 => "Left",
-                            1 => "Right",
-                            2 => "Bottom",
-                            3 => "Top",
-                            4 => "Near",
-                            5 => "Far",
-                            _ => "Unknown",
-                        };
-                        println!("  ⚠ Test point OUTSIDE {} plane! (dist={:.3})", name, dist);
-                    }
-                }
-                if all_inside {
-                    println!("  ✓ Test point correctly inside all valid planes");
-                }
-
-                // Test a point BEHIND camera (should be culled)
-                let behind_point = cam_pos - cam_forward * 5.0;
-                println!("\nTest point BEHIND camera: {:?}", behind_point);
-                for (i, plane) in planes.iter().enumerate() {
-                    if !valid_planes[i] {
-                        continue;
-                    }
-                    let dist = plane[0] * behind_point.x
-                        + plane[1] * behind_point.y
-                        + plane[2] * behind_point.z
-                        + plane[3];
-                    if i == 4 {
-                        // Near plane
-                        println!(
-                            "  Near plane dist for point behind: {:.3} (should be NEGATIVE)",
-                            dist
-                        );
-                    }
-                }
-
-                // Test your first object
-                if let Ok(r) = rcx.frame_transforms[image_index as usize].read() {
-                    if !r.is_empty() {
-                        let first_pos = Vector3::new(r[0].trs[12], r[0].trs[13], r[0].trs[14]);
-                        println!("\nFirst object pos: {:?}", first_pos);
-
-                        let to_obj = first_pos - cam_pos;
-                        let forward_dot = to_obj.dot(&cam_forward);
-                        println!(
-                            "  Distance along camera forward: {:.3} (positive = in front)",
-                            forward_dot
-                        );
-
-                        for (i, plane) in planes.iter().enumerate() {
-                            if !valid_planes[i] {
-                                continue;
-                            }
-                            let dist = plane[0] * first_pos.x
-                                + plane[1] * first_pos.y
-                                + plane[2] * first_pos.z
-                                + plane[3];
-                            let name = match i {
-                                0 => "Left",
-                                1 => "Right",
-                                2 => "Bottom",
-                                3 => "Top",
-                                4 => "Near",
-                                5 => "Far",
-                                _ => "Unknown",
-                            };
-                            let status = if dist >= 0.0 { "INSIDE" } else { "OUTSIDE" };
-                            println!("  {} plane dist: {:.3} ({})", name, dist, status);
-                        }
-                    }
-                }
-            }
-
-            if let Ok(mut w) = rcx.frustum_buffers[image_index as usize].write() {
-                w.planes = planes;
-            }
-        }
-
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
             self.graphics_queue.queue_family_index(),
@@ -1159,103 +964,39 @@ impl App {
         rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
 
         let transforms = rcx.frame_transforms[image_index as usize].clone();
-        let visibility = rcx.visibility_buffers[image_index as usize].clone();
-        let mesh_offsets = rcx.mesh_offsets_buffers[image_index as usize].clone();
-        let indirect = rcx.indirect_buffers[image_index as usize].clone();
-        let frustum = rcx.frustum_buffers[image_index as usize].clone();
+        let material_ids = rcx.material_id_buffers[image_index as usize].clone();
 
         {
-            // Clear visibility buffer
-            if let Ok(mut v) = visibility.write() {
-                for x in v.iter_mut() {
-                    *x = 0;
+            /* === TRANSFORMS === */
+            if let Ok(mut w) = transforms.write() {
+                let n = rcx.frame_submission.transforms.len().min(w.len());
+                w[..n].copy_from_slice(&rcx.frame_submission.transforms[..n]);
+            }
+
+            if let Ok(mut w) = material_ids.write() {
+                let mesh = &rcx.meshes["viking_room"];
+                let lod_count = mesh.lods.len();
+
+                let mut draw_id = 0;
+
+                for _ in 0..lod_count {
+                    for sub in &mesh.submeshes {
+                        w[draw_id] = sub.material_index;
+                        draw_id += 1;
+                    }
+                }
+            }
+
+            let indirect = rcx.indirect_buffers[image_index as usize].clone();
+            let total_instances = rcx.frame_submission.transforms.len() as u32;
+
+            if let Ok(mut cmds) = indirect.write() {
+                for cmd in cmds.iter_mut() {
+                    cmd.first_instance = 0;
+                    cmd.instance_count = total_instances;
                 }
             }
         }
-        let count = transforms.len() as u32;
-        let groups = (count + 255) / 256;
-
-        // ====================================================================
-        // COMPUTE PASS 1: Culling
-        // ====================================================================
-        {
-            let cull_set = DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                rcx.cull_pass.set_layout.clone(),
-                [
-                    WriteDescriptorSet::buffer(0, transforms.clone()),
-                    WriteDescriptorSet::buffer(1, visibility.clone()),
-                    WriteDescriptorSet::buffer(2, frustum),
-                ],
-                [],
-            )
-            .unwrap();
-
-            unsafe {
-                graphics_builder
-                    .begin_debug_utils_label(DebugUtilsLabel {
-                        label_name: "Cull compute".to_string(),
-                        color: [0.1, 0.9, 0.5, 1.0],
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    .bind_pipeline_compute(rcx.cull_pass.pipeline.clone())
-                    .unwrap()
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        rcx.cull_pass.pipeline.layout().clone(),
-                        0,
-                        cull_set,
-                    )
-                    .unwrap()
-                    .dispatch([groups, 1, 1])
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
-        };
-
-        // ====================================================================
-        // COMPUTE PASS 2: Prefix Sum
-        // ====================================================================
-        {
-            let prefix_set = DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                rcx.prefix_pass.set_layout.clone(),
-                [
-                    WriteDescriptorSet::buffer(0, visibility.clone()),
-                    WriteDescriptorSet::buffer(1, indirect.clone()),
-                    WriteDescriptorSet::buffer(2, mesh_offsets.clone()),
-                ],
-                [],
-            )
-            .unwrap();
-
-            unsafe {
-                graphics_builder
-                    .begin_debug_utils_label(DebugUtilsLabel {
-                        label_name: "Cull prefix compute".to_string(),
-                        color: [0.1, 0.5, 0.9, 1.0],
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    .bind_pipeline_compute(rcx.prefix_pass.pipeline.clone())
-                    .unwrap()
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        rcx.prefix_pass.pipeline.layout().clone(),
-                        0,
-                        prefix_set,
-                    )
-                    .unwrap()
-                    .push_constants(rcx.prefix_pass.pipeline.layout().clone(), 0, 1u32)
-                    .unwrap()
-                    .dispatch([groups, 1, 1])
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
-        };
 
         {
             // Pre-Depth instanced pass
@@ -1291,7 +1032,7 @@ impl App {
                     depth_attachment: Some(RenderingAttachmentInfo {
                         load_op: AttachmentLoadOp::Clear,
                         store_op: AttachmentStoreOp::Store,
-                        clear_value: Some(ClearValue::Depth(1.0)),
+                        clear_value: Some(ClearValue::Depth(0.0)),
                         ..RenderingAttachmentInfo::image_view(
                             rcx.mrt_pass.gbuffer_depth_view.clone(),
                         )
@@ -1303,6 +1044,24 @@ impl App {
                 .unwrap()
                 .set_scissor(0, [rcx.scissor].into_iter().collect())
                 .unwrap()
+                .set_depth_compare_op(CompareOp::GreaterOrEqual)
+                .unwrap()
+                .set_depth_write_enable(true)
+                .unwrap()
+                .set_depth_test_enable(true)
+                .unwrap()
+                .set_cull_mode(if self.cull_backfaces {
+                    CullMode::Back
+                } else {
+                    CullMode::Front
+                })
+                .unwrap()
+                .set_front_face(if self.clockwise_front_face {
+                    FrontFace::Clockwise
+                } else {
+                    FrontFace::CounterClockwise
+                })
+                .unwrap()
                 .bind_pipeline_graphics(rcx.mrt_pass.predepth_pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
@@ -1312,9 +1071,9 @@ impl App {
                     sets.to_vec(),
                 )
                 .unwrap()
-                .bind_vertex_buffers(0, self.vertex_buffer.clone())
+                .bind_vertex_buffers(0, rcx.meshes["viking_room"].position_vertex_buffer.clone())
                 .unwrap()
-                .bind_index_buffer(self.index_buffer.clone())
+                .bind_index_buffer(rcx.meshes["viking_room"].index_buffer.clone())
                 .unwrap();
 
             unsafe {
@@ -1330,24 +1089,42 @@ impl App {
         }
 
         {
-            // Pass 1: MRT with instanced geometry
+            let layout = rcx
+                .mrt_pass
+                .gbuffer_instanced_pipeline
+                .layout()
+                .set_layouts()[1]
+                .clone();
 
             let set = DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
-                rcx.mrt_pass
-                    .gbuffer_instanced_pipeline
-                    .layout()
-                    .set_layouts()[1]
-                    .clone(),
+                layout,
                 [
-                    WriteDescriptorSet::image_view_sampler(
+                    WriteDescriptorSet::image_view_sampler_array(
                         0,
-                        rcx.white_image_sampler.clone(),
-                        rcx.default_sampler.clone(),
+                        0,
+                        rcx.meshes["viking_room"]
+                            .texture_array
+                            .iter()
+                            .cloned()
+                            .map(|v| (v, rcx.default_sampler.clone()))
+                            .chain(std::iter::repeat((
+                                rcx.white_image_sampler.clone(),
+                                rcx.default_sampler.clone(),
+                            )))
+                            .take(256),
                     ),
                     WriteDescriptorSet::buffer(
                         1,
                         rcx.frame_transforms[image_index as usize].clone(),
+                    ),
+                    WriteDescriptorSet::buffer(
+                        2,
+                        rcx.material_id_buffers[image_index as usize].clone(),
+                    ),
+                    WriteDescriptorSet::buffer(
+                        3,
+                        rcx.meshes["viking_room"].materials_buffer.clone(),
                     ),
                 ],
                 [],
@@ -1412,6 +1189,24 @@ impl App {
                 .unwrap()
                 .set_scissor(0, [rcx.scissor].into_iter().collect())
                 .unwrap()
+                .set_depth_compare_op(CompareOp::Equal)
+                .unwrap()
+                .set_depth_write_enable(true)
+                .unwrap()
+                .set_depth_test_enable(true)
+                .unwrap()
+                .set_cull_mode(if self.cull_backfaces {
+                    CullMode::Back
+                } else {
+                    CullMode::Front
+                })
+                .unwrap()
+                .set_front_face(if self.clockwise_front_face {
+                    FrontFace::Clockwise
+                } else {
+                    FrontFace::CounterClockwise
+                })
+                .unwrap()
                 .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_instanced_pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
@@ -1421,9 +1216,9 @@ impl App {
                     sets.to_vec(),
                 )
                 .unwrap()
-                .bind_vertex_buffers(0, self.vertex_buffer.clone())
+                .bind_vertex_buffers(0, rcx.meshes["viking_room"].vertex_buffer.clone())
                 .unwrap()
-                .bind_index_buffer(self.index_buffer.clone())
+                .bind_index_buffer(rcx.meshes["viking_room"].index_buffer.clone())
                 .unwrap();
 
             unsafe {
@@ -1551,8 +1346,8 @@ impl App {
 
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Compositing".to_string(),
-                    color: [0.99, 0.99, 0.0, 1.0],
+                    label_name: "Presentation".to_string(),
+                    color: [0.99, 0.0, 0.75, 1.0],
                     ..Default::default()
                 })
                 .unwrap()
@@ -1622,60 +1417,20 @@ impl App {
     }
 }
 
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-struct MyVertex {
-    #[format(R32G32B32_SFLOAT)]
-    position: [f32; 3],
-    #[format(R32G32_SFLOAT)]
-    uvs: [f32; 2],
-    #[format(R32G32B32_SFLOAT)]
-    normal: [f32; 3],
-}
-
 fn window_size_dependent_setup(
     device: &Arc<Device>,
     memory_allocator: &Arc<GenericMemoryAllocator<FreeListAllocator>>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     default_sampler: &Arc<Sampler>,
     swapchain_images: &[Arc<Image>],
-) -> (
-    SwapchainPass,
-    MRT,
-    MRTLighting,
-    Composite,
-    BloomPass,
-    CullPass,
-    PrefixPass,
-) {
+) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
     let predepth_pipeline = {
         mod vs {
             vulkano_shaders::shader! {
                 ty: "vertex",
-                src: r"
-                #version 450
-                layout(location = 0) in vec3 position;
-
-                layout(set=0, binding=0, std140) uniform UBO {
-                    mat4 view;
-                    mat4 projection;
-                    mat4 inverse_projection;
-                    vec4 sun_direction;
-                };
-
-                struct Transform { mat4 t; };
-                layout(set = 1, binding = 1, std140) readonly buffer SSBO {
-                    Transform transforms[];
-                };
-
-                void main() {
-                    int index = gl_InstanceIndex;
-                    mat4 model = transforms[index].t;
-
-                    vec4 world_pos = model * vec4(position,1.0);
-                    gl_Position = projection * (view * world_pos);
-                }
-            "
+                vulkan_version: "1.3",
+                spirv_version: "1.6",
+                path: "assets/shaders/predepth.vert",
             }
         }
 
@@ -1698,7 +1453,7 @@ fn window_size_dependent_setup(
             .entry_point("main")
             .unwrap();
 
-        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
+        let vertex_input_state = PositionMeshVertex::per_vertex().definition(&vs).unwrap();
 
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
@@ -1742,7 +1497,7 @@ fn window_size_dependent_setup(
             rasterizer_discard_enable: false,
             polygon_mode: Default::default(),
             cull_mode: CullMode::Back,
-            front_face: FrontFace::CounterClockwise,
+            front_face: FrontFace::Clockwise,
             depth_bias: None,
             line_width: 1.0,
             line_rasterization_mode: Default::default(),
@@ -1752,235 +1507,39 @@ fn window_size_dependent_setup(
         });
         ci.multisample_state = Some(MultisampleState::default());
         ci.depth_stencil_state = Some(DepthStencilState {
-            depth: Some(DepthState::simple()), // Important
+            depth: Some(DepthState::reverse()), // Important
             ..Default::default()
         });
         ci.subpass = Some(subpass.into());
         ci.stages = stages.into_iter().collect();
         ci.dynamic_state.insert(DynamicState::Viewport);
         ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+        ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+        ci.dynamic_state.insert(DynamicState::CullMode);
+        ci.dynamic_state.insert(DynamicState::FrontFace);
 
         GraphicsPipeline::new(device.clone(), None, ci).unwrap()
     };
 
-    // ==============================================================
-    // === MRT GEOMETRY PASS (Unmodified from your version)
-    // ==============================================================
-    let mrt_pipeline = {
-        mod vs {
-            vulkano_shaders::shader! {
-                ty: "vertex",
-                src: r"
-                    #version 450
-
-                    layout(location = 0) in vec3 position;
-                    layout(location = 1) in vec2 uvs;
-                    layout(location = 2) in vec3 normal;
-
-                    layout(location = 0) out vec3 v_normal;
-                    layout(location = 1) out vec2 v_uvs;
-
-                    layout(set=0, binding=0, std140) uniform UBO {
-                        mat4 view;
-                        mat4 projection;
-                        mat4 inverse_projection;
-                        vec4 sun_direction;
-                    };
-
-                    layout(push_constant, std430) uniform PC {
-                        mat4 model;
-                    };
-
-                    void main() {
-                        mat3 normal_mat = transpose(inverse(mat3(model)));
-                        vec3 world_norm = normalize(normal_mat * normal);
-
-                        vec4 world_pos = model * vec4(position,1.0);
-                        vec4 view_pos = view * world_pos;
-
-                        v_normal = normalize((view * vec4(world_norm,0.0)).xyz);
-                        v_uvs = uvs;
-
-                        gl_Position = projection * view_pos;
-                    }
-                ",
-            }
-        }
-
-        mod fs {
-            vulkano_shaders::shader! {
-                ty: "fragment",
-                src: r"
-                    #version 450
-
-                    layout(location = 0) in vec3 v_normal;
-                    layout(location = 1) in vec2 v_uvs;
-
-                    layout(location = 0) out vec4 normal_mrt;
-                    layout(location = 1) out vec4 uvs_mrt;
-                    layout(location = 2) out vec4 albedo_mrt;
-
-                    layout (set = 1, binding = 0) uniform sampler2D albedo_tex;
-
-                    void main() {
-                        normal_mrt = vec4(normalize(v_normal), 0.0);
-                        uvs_mrt = vec4(v_uvs, 0.0, 0.0);
-                        albedo_mrt = texture(albedo_tex, v_uvs);
-                    }
-                ",
-            }
-        }
-
-        let vs = vs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-        let fs = fs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-
-        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
-
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs),
-            PipelineShaderStageCreateInfo::new(fs),
-        ];
-
-        let subpass = PipelineRenderingCreateInfo {
-            color_attachment_formats: vec![
-                Some(Format::R16G16B16A16_SFLOAT),
-                Some(Format::R16G16B16A16_SFLOAT),
-                Some(Format::R16G16B16A16_SFLOAT),
-            ],
-            depth_attachment_format: Some(Format::D24_UNORM_S8_UINT),
-            ..Default::default()
-        };
-
-        const PC_RANGE: PushConstantRange = PushConstantRange {
-            stages: ShaderStages::VERTEX,
-            offset: 0,
-            size: std::mem::size_of::<PushConsts>() as u32,
-        };
-
-        let layout = {
-            let mut set_layout_1 = DescriptorSetLayoutCreateInfo::default();
-            let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-            bind.stages = ShaderStages::FRAGMENT;
-            set_layout_1.bindings.insert(0, bind);
-
-            let mut set_layouts = renderer_set_0_layouts();
-            set_layouts.push(set_layout_1);
-            let infos = PipelineDescriptorSetLayoutCreateInfo {
-                flags: Default::default(),
-                set_layouts,
-                push_constant_ranges: vec![PC_RANGE],
-            };
-            PipelineLayout::new(
-                device.clone(),
-                infos
-                    .into_pipeline_layout_create_info(device.clone())
-                    .unwrap(),
-            )
-            .unwrap()
-        };
-
-        let mut ci = GraphicsPipelineCreateInfo::layout(layout);
-        ci.vertex_input_state = Some(vertex_input_state);
-        ci.input_assembly_state = Some(InputAssemblyState::default());
-        ci.viewport_state = Some(ViewportState::default());
-        ci.rasterization_state = Some(RasterizationState::default());
-        ci.color_blend_state = Some(ColorBlendState {
-            attachments: vec![
-                ColorBlendAttachmentState::default(),
-                ColorBlendAttachmentState::default(),
-                ColorBlendAttachmentState::default(),
-            ],
-            ..Default::default()
-        });
-        ci.multisample_state = Some(MultisampleState::default());
-        ci.subpass = Some(subpass.into());
-        ci.depth_stencil_state = Some(DepthStencilState {
-            depth: Some(DepthState {
-                write_enable: false,
-                compare_op: CompareOp::Equal,
-            }),
-            ..Default::default()
-        });
-        ci.stages = stages.into_iter().collect();
-        ci.dynamic_state.insert(DynamicState::Viewport);
-        ci.dynamic_state.insert(DynamicState::Scissor);
-
-        GraphicsPipeline::new(device.clone(), None, ci).unwrap()
-    };
     let mrt_instanced_pipeline = {
         mod vs {
             vulkano_shaders::shader! {
                 ty: "vertex",
-                src: r"
-                    #version 450
-
-                    layout(location = 0) in vec3 position;
-                    layout(location = 1) in vec2 uvs;
-                    layout(location = 2) in vec3 normal;
-
-                    layout(location = 0) out vec3 v_normal;
-                    layout(location = 1) out vec2 v_uvs;
-
-                    layout(set=0, binding=0, std140) uniform UBO {
-                        mat4 view;
-                        mat4 projection;
-                        mat4 inverse_projection;
-                        vec4 sun_direction;
-                    };
-
-                    struct Transform {
-                        mat4 t;
-                    };
-                    layout(set = 1, binding = 1, std140) readonly buffer SSBO {
-                        Transform transforms[];
-                    };
-
-                    void main() {
-                        int index = gl_InstanceIndex;
-
-                        mat4 model = transforms[index].t;
-                        mat3 normal_mat = transpose(inverse(mat3(model)));
-                        vec3 world_norm = normalize(normal_mat * normal);
-
-                        vec4 world_pos = model * vec4(position,1.0);
-                        vec4 view_pos = view * world_pos;
-
-                        v_normal = normalize((view * vec4(world_norm,0.0)).xyz);
-                        v_uvs = uvs;
-
-                        gl_Position = projection * view_pos;
-                    }
-                ",
+                vulkan_version: "1.3",
+                spirv_version: "1.6",
+                path: "assets/shaders/instanced_mrt.vert",
             }
         }
 
         mod fs {
             vulkano_shaders::shader! {
                 ty: "fragment",
-                src: r"
-                    #version 450
-
-                    layout(location = 0) in vec3 v_normal;
-                    layout(location = 1) in vec2 v_uvs;
-
-                    layout(location = 0) out vec4 normal_mrt;
-                    layout(location = 1) out vec4 uvs_mrt;
-                    layout(location = 2) out vec4 albedo_mrt;
-
-                    layout (set = 1, binding = 0) uniform sampler2D albedo_tex;
-
-                    void main() {
-                        normal_mrt = vec4(normalize(v_normal), 0.0);
-                        uvs_mrt = vec4(v_uvs, 0.0, 0.0);
-                        albedo_mrt = texture(albedo_tex, v_uvs);
-                    }
-                ",
+                vulkan_version: "1.3",
+                spirv_version: "1.6",
+                path: "./assets/shaders/instanced_mrt.frag",
+                include: ["./assets/shaders/include"],
             }
         }
 
@@ -1993,7 +1552,7 @@ fn window_size_dependent_setup(
             .entry_point("main")
             .unwrap();
 
-        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
+        let vertex_input_state = StandardMeshVertex::per_vertex().definition(&vs).unwrap();
 
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
@@ -2012,13 +1571,27 @@ fn window_size_dependent_setup(
 
         let layout = {
             let mut set_layout_1 = DescriptorSetLayoutCreateInfo::default();
-            let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-            bind.stages = ShaderStages::FRAGMENT;
-            set_layout_1.bindings.insert(0, bind);
 
-            let mut bind_ssbo = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
-            bind_ssbo.stages = ShaderStages::VERTEX;
-            set_layout_1.bindings.insert(1, bind_ssbo);
+            /* binding 0: sampler2D textures[] */
+            let mut tex_bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+            tex_bind.stages = ShaderStages::FRAGMENT;
+            tex_bind.descriptor_count = 2.max(256); // TODO! FIX!
+            set_layout_1.bindings.insert(0, tex_bind);
+
+            /* binding 1: Transform SSBO */
+            let mut transform_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
+            transform_bind.stages = ShaderStages::VERTEX;
+            set_layout_1.bindings.insert(1, transform_bind);
+
+            /* binding 2: material_ids[] */
+            let mut matid_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
+            matid_bind.stages = ShaderStages::VERTEX;
+            set_layout_1.bindings.insert(2, matid_bind);
+
+            /* binding 3: GpuMaterial[] */
+            let mut mat_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
+            mat_bind.stages = ShaderStages::FRAGMENT;
+            set_layout_1.bindings.insert(3, mat_bind);
 
             let mut set_layouts = renderer_set_0_layouts();
             set_layouts.push(set_layout_1);
@@ -2045,7 +1618,7 @@ fn window_size_dependent_setup(
             rasterizer_discard_enable: false,
             polygon_mode: Default::default(),
             cull_mode: CullMode::Back,
-            front_face: FrontFace::CounterClockwise,
+            front_face: FrontFace::Clockwise,
             depth_bias: None,
             line_width: 1.0,
             line_rasterization_mode: Default::default(),
@@ -2073,6 +1646,11 @@ fn window_size_dependent_setup(
         ci.stages = stages.into_iter().collect();
         ci.dynamic_state.insert(DynamicState::Viewport);
         ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+        ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+        ci.dynamic_state.insert(DynamicState::CullMode);
+        ci.dynamic_state.insert(DynamicState::FrontFace);
 
         GraphicsPipeline::new(device.clone(), None, ci).unwrap()
     };
@@ -2139,7 +1717,6 @@ fn window_size_dependent_setup(
 
     let mrt = MRT {
         predepth_pipeline,
-        gbuffer_pipeline: mrt_pipeline,
         gbuffer_instanced_pipeline: mrt_instanced_pipeline,
         gbuffer_depth_view: to_view(depth_image.clone()),
         gbuffer_image_views: gbuffer_images
@@ -2186,37 +1763,7 @@ fn window_size_dependent_setup(
             mod fs {
                 vulkano_shaders::shader! {
                     ty: "fragment",
-                    src: r"
-                        #version 450
-                        layout(location = 0) in vec2 v_uvs;
-
-                        layout(set = 0, binding = 0) uniform UBO {
-                            mat4 view;
-                            mat4 projection;
-                            mat4 inverse_projection;
-                            vec4 sun_direction;
-                        } ubo;
-
-                        layout(set=1, binding=0) uniform sampler2D normal_tex;
-                        layout(set=1, binding=1) uniform sampler2D uvs_tex;
-                        layout(set=1, binding=2) uniform sampler2D albedo_tex;
-                        layout(set=1, binding=3) uniform sampler2D depth_tex;
-
-                        layout(location = 0) out vec4 out_hdr;
-
-                        void main() {
-                            float depth = texture(depth_tex, v_uvs).r;
-                            if(depth >= 1.0) discard;
-
-                            vec3 N = normalize(texture(normal_tex, v_uvs).xyz);
-                            vec3 L = normalize(ubo.sun_direction.xyz);
-                            float ndotl = max(dot(N,L), 0.0);
-
-                            vec3 albedo = vec3(0.8, 0.9, 0.1) * texture(albedo_tex, v_uvs).xyz;
-
-                            out_hdr = vec4(albedo * ndotl, 1.0);
-                        }
-                    "
+                    path: "assets/shaders/mrt_lighting.frag",
                 }
             }
 
@@ -2335,6 +1882,9 @@ fn window_size_dependent_setup(
             ci.stages.push(stages[1].clone());
             ci.dynamic_state.insert(DynamicState::Viewport);
             ci.dynamic_state.insert(DynamicState::Scissor);
+            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
 
             MRTLighting {
                 pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
@@ -2499,6 +2049,9 @@ fn window_size_dependent_setup(
             ci.stages.push(stages[1].clone());
             ci.dynamic_state.insert(DynamicState::Viewport);
             ci.dynamic_state.insert(DynamicState::Scissor);
+            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
 
             Composite {
                 pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
@@ -2609,6 +2162,9 @@ fn window_size_dependent_setup(
             .collect();
             ci.dynamic_state.insert(DynamicState::Viewport);
             ci.dynamic_state.insert(DynamicState::Scissor);
+            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
 
             let pipeline = GraphicsPipeline::new(device.clone(), None, ci).unwrap();
 
@@ -2649,15 +2205,7 @@ fn window_size_dependent_setup(
         pass
     };
 
-    let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
+    // let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
 
-    (
-        swapchain_pass,
-        mrt,
-        mrt_lighting,
-        composite,
-        bloom_pass,
-        cull_compute_pass,
-        cull_prefix_pass,
-    )
+    (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass)
 }
