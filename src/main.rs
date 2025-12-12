@@ -507,8 +507,8 @@ impl ApplicationHandler for App {
 
         let mut mesh_streams = HashMap::new();
 
-        let meshes = mesh_registry.read().unwrap();
-        for (_name, mesh) in meshes.iter() {
+        let meshes = mesh_registry.clone();
+        for (_name, mesh) in meshes.read().unwrap().iter() {
             let draw_count = mesh.lods.len() * mesh.submeshes.len();
 
             let indirect = Buffer::from_iter(
@@ -680,7 +680,7 @@ impl ApplicationHandler for App {
                 mesh_draws: vec![],
                 draws: vec![],
             },
-            mesh_registry,
+            meshes: mesh_registry,
             mesh_streams,
         });
     }
@@ -710,7 +710,7 @@ impl ApplicationHandler for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyY) => {
                             let lod_count =
-                                self.rcx.as_ref().unwrap().meshes["viking_room"].lods.len();
+                                self.rcx.as_ref().unwrap().meshes.read().unwrap().get("viking_room").unwrap().lods.len();
                             self.lod_choice = (self.lod_choice + 1) % lod_count;
                             println!("LOD set to {}", self.lod_choice);
                         }
@@ -840,8 +840,10 @@ impl App {
         let rcx = self.rcx.as_mut().unwrap();
         rcx.frame_submission.draws.clear();
 
-        for t in rcx.static_transforms.clone() {
-            rcx.draw_mesh(rcx.meshes["viking_room"].clone(), t, None);
+        if let Ok(registry) = rcx.meshes.clone().read() {
+            for t in rcx.static_transforms.clone() {
+                rcx.draw_mesh(registry.get("viking_room").unwrap().clone(), t, None);
+            }
         }
 
         rcx.build_frame();
