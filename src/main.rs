@@ -23,6 +23,8 @@ use crate::scene::Scene;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use nalgebra::{Matrix4, Translation3};
+use imgui::{Condition, Context};
+use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
@@ -287,6 +289,10 @@ struct RenderContext {
     composite: Composite,
     swapchain_pass: SwapchainPass,
     bloom_pass: BloomPass,
+
+    winit_platform: WinitPlatform,
+    imgui_context: Context,
+    imgui_renderer: (),
 }
 
 impl RenderContext {
@@ -743,6 +749,12 @@ impl ApplicationHandler for App {
             ));
         }
 
+
+        let mut imgui = Context::create();
+
+        let mut platform = WinitPlatform::new(&mut imgui); // step 1
+        platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -775,6 +787,10 @@ impl ApplicationHandler for App {
             },
             meshes: mesh_registry,
             mesh_streams,
+
+            winit_platform: platform,
+            imgui_context: imgui,
+            imgui_renderer: (),
         });
     }
 
@@ -935,6 +951,23 @@ fn create_image(
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
+        let ui = rcx.imgui_context.new_frame();
+        ui.window("Hello world")
+            .size([300.0, 100.0], Condition::FirstUseEver)
+            .build(|| {
+                ui.text("Hello world!");
+                ui.text("こんにちは世界！");
+                ui.text("This...is...imgui-rs!");
+                ui.separator();
+                let mouse_pos = ui.io().mouse_pos;
+                ui.text(format!(
+                    "Mouse Position: ({:.1},{:.1})",
+                    mouse_pos[0], mouse_pos[1]
+                ));
+            });
+        rcx.winit_platform.prepare_render(ui, &rcx.window); // step 5
+        rcx.imgui_context.render();
+
         rcx.frame_submission.clear_all();
 
         self.scene.update();
