@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_nonuniform_qualifier : enable
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in vec2 v_uvs;
@@ -18,12 +19,17 @@ layout(set = 1, binding = 3, std430) readonly buffer Materials {
 };
 
 void main() {
-    GpuMaterial mat =materials[v_material_id];
+    GpuMaterial mat = materials[v_material_id];
 
-    vec4 albedo = texture(textures[mat . base_color_tex], v_uvs);
+    uint tex_index = mat.base_color_tex;
+
+    vec4 albedo = texture(
+    textures[nonuniformEXT(tex_index)],
+    v_uvs
+    );
 
     normal_mrt = vec4(normalize(v_normal), 0.0);
     uvs_mrt = vec4(v_uvs, 0.0, 0.0);
-    albedo_mrt = albedo * mat . base_color;
+    albedo_mrt = albedo * mat.base_color;
     material_id = v_material_id;
 }

@@ -1,29 +1,34 @@
 extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
+mod components;
 mod input_state;
 mod main_helpers;
 mod math;
 mod mesh;
+mod mesh_registry;
+mod scene;
 mod shader_bindings;
 mod texture_cache;
 mod vertex;
-mod mesh_registry;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
+use crate::components::{MeshComponent, Transform, Visible};
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
-use crate::mesh::{MeshAsset, import_gltf, upload_build_mesh, load_meshes_from_directory};
+use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
+use crate::mesh_registry::MeshRegistry;
+use crate::scene::Scene;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
+use std::sync::RwLock;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use std::sync::RwLock;
 use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
@@ -32,7 +37,7 @@ use vulkano::device::DeviceOwned;
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
-    SamplerMipmapMode, SamplerReductionMode,
+    SamplerMipmapMode,
 };
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{ImageAspects, ImageSubresourceRange, SampleCount};
@@ -96,7 +101,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use crate::mesh_registry::MeshRegistry;
 
 const INSTANCE_COUNT: DeviceSize = 200;
 
@@ -113,6 +117,60 @@ struct MeshDrawStream {
     material_ids: Subbuffer<[u32]>,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Culling {
+    None,
+    Back,
+    Front,
+    All,
+}
+
+impl Culling {
+    fn next(self) -> Self {
+        match self {
+            Self::None => Self::Back,
+            Self::Back => Self::Front,
+            Self::Front => Self::All,
+            Self::All => Self::None,
+        }
+    }
+}
+
+impl From<Culling> for CullMode {
+    fn from(value: Culling) -> Self {
+        match value {
+            Culling::None => CullMode::None,
+            Culling::Back => CullMode::Back,
+            Culling::Front => CullMode::Front,
+            Culling::All => CullMode::FrontAndBack,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Winding {
+    CounterClockwise,
+    Clockwise,
+}
+
+impl Winding {
+    fn toggle(self) -> Self {
+        match self {
+            Self::CounterClockwise => Self::Clockwise,
+            Self::Clockwise => Self::CounterClockwise,
+        }
+    }
+}
+
+impl From<Winding> for FrontFace {
+    fn from(value: Winding) -> Self {
+        match value {
+            Winding::Clockwise => FrontFace::Clockwise,
+            Winding::CounterClockwise => FrontFace::CounterClockwise,
+        }
+    }
+}
+
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
@@ -126,9 +184,10 @@ struct App {
     input_state: InputState,
     camera: Camera,
     last_frame: Instant,
+    scene: Scene,
 
-    cull_backfaces: bool,
-    clockwise_front_face: bool,
+    cull_backfaces: Culling,
+    clockwise_front_face: Winding,
     lod_choice: usize,
 }
 struct MRT {
@@ -168,6 +227,7 @@ pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
 
+#[derive(Clone)]
 struct DrawSubmission {
     mesh: Arc<MeshAsset>,
     transform: TransformTRS,
@@ -187,6 +247,19 @@ struct FrameSubmission {
     mesh_draws: Vec<MeshDraw>,     // executable
 }
 
+impl FrameSubmission {
+    pub fn drain_draws_into(&mut self, dst: &mut Vec<DrawSubmission>) {
+        dst.extend(self.draws.drain(..));
+    }
+
+    pub fn clear_all(&mut self) {
+        self.draws.clear();
+        self.transforms.clear();
+        self.material_ids.clear();
+        self.mesh_draws.clear();
+    }
+}
+
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
@@ -194,7 +267,6 @@ struct RenderContext {
     scissor: Scissor,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
-    default_sampler: Arc<Sampler>,
     start_time: Instant,
     elapsed_millis: u64,
 
@@ -202,9 +274,8 @@ struct RenderContext {
     mesh_streams: HashMap<Arc<MeshAsset>, MeshDrawStream>,
 
     frame_transforms: Vec<Subbuffer<[TransformTRS]>>, // TODO: Move
-    static_transforms: Vec<TransformTRS>,
-    white_image_sampler: Arc<ImageView>,
-    black_image_sampler: Arc<ImageView>,
+    white_image_sampler: Arc<ImageViewSampler>,
+    black_image_sampler: Arc<ImageViewSampler>,
 
     context_descriptor_set: FrameDescriptorSet,
     frame_uniform_buffers: Vec<Subbuffer<RendererUBO>>,
@@ -336,11 +407,16 @@ impl App {
                 queue_create_infos: infos,
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
+                    sampler_anisotropy: true,
                     dynamic_rendering: true,
                     timeline_semaphore: true,
                     shader_draw_parameters: true,
                     multi_draw_indirect: true,
                     buffer_device_address: true,
+                    runtime_descriptor_array: true,
+                    descriptor_binding_partially_bound: true,
+                    shader_sampled_image_array_non_uniform_indexing: true,
+                    shader_sampled_image_array_dynamic_indexing: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -366,6 +442,14 @@ impl App {
             Default::default(),
         ));
 
+        let mut scene = Scene::new();
+        scene.resources.insert(FrameSubmission {
+            draws: vec![],
+            transforms: vec![],
+            material_ids: vec![],
+            mesh_draws: vec![],
+        });
+
         Ok(App {
             instance,
             device,
@@ -378,9 +462,10 @@ impl App {
             camera: Camera::new(),
             last_frame: Instant::now(),
             rcx: None,
-            cull_backfaces: true,
-            clockwise_front_face: true,
+            cull_backfaces: Culling::Back,
+            clockwise_front_face: Winding::CounterClockwise,
             lod_choice: 0,
+            scene,
         })
     }
 }
@@ -460,25 +545,20 @@ impl ApplicationHandler for App {
             .unwrap()
         };
 
+        const MIP_COUNT: f32 = 16.0;
         let default_sampler = Sampler::new(
             self.device.clone(),
             SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                mipmap_mode: SamplerMipmapMode::Nearest,
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Linear,
                 address_mode: [
                     SamplerAddressMode::Repeat,
                     SamplerAddressMode::Repeat,
                     SamplerAddressMode::Repeat,
                 ],
-                mip_lod_bias: 0.0,
-                anisotropy: None,
-                compare: None,
-                lod: 0.0..=1.0,
-                border_color: BorderColor::FloatTransparentBlack,
-                unnormalized_coordinates: false,
-                reduction_mode: SamplerReductionMode::WeightedAverage,
-                sampler_ycbcr_conversion: None,
+                anisotropy: Some(MIP_COUNT),
+                lod: 0.0..=LOD_CLAMP_NONE,
                 ..Default::default()
             },
         )
@@ -489,12 +569,14 @@ impl ApplicationHandler for App {
             &self.command_buffer_allocator,
             &self.memory_allocator,
             0xFF,
+            default_sampler.clone(),
         );
         let black_tex = create_image(
             &self.graphics_queue,
             &self.command_buffer_allocator,
             &self.memory_allocator,
             0x00,
+            default_sampler.clone(),
         );
 
         let mesh_registry = load_meshes_from_directory(
@@ -502,7 +584,7 @@ impl ApplicationHandler for App {
             &self.memory_allocator,
             &self.command_buffer_allocator,
             &self.graphics_queue,
-            &white_tex,
+            white_tex.clone(),
         );
 
         let mut mesh_streams = HashMap::new();
@@ -530,7 +612,7 @@ impl ApplicationHandler for App {
                     first_instance: 0,
                 }),
             )
-                .unwrap();
+            .unwrap();
 
             let material_ids = Buffer::new_slice::<u32>(
                 self.memory_allocator.clone(),
@@ -545,7 +627,7 @@ impl ApplicationHandler for App {
                 },
                 draw_count as DeviceSize,
             )
-                .unwrap();
+            .unwrap();
 
             {
                 let mut w = material_ids.write().unwrap();
@@ -567,7 +649,7 @@ impl ApplicationHandler for App {
                 &self.device,
                 &self.memory_allocator,
                 &self.descriptor_set_allocator,
-                &default_sampler,
+                white_tex.clone(),
                 &swapchain_images,
             );
 
@@ -646,7 +728,20 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let static_transforms = generate_random_transforms(INSTANCE_COUNT);
+        let mesh = mesh_registry
+            .read()
+            .unwrap()
+            .get("viking_room")
+            .unwrap()
+            .clone();
+
+        for trs in generate_random_transforms(INSTANCE_COUNT) {
+            self.scene.world.push((
+                Transform { trs },
+                MeshComponent { mesh: mesh.clone() },
+                Visible,
+            ));
+        }
 
         self.rcx = Some(RenderContext {
             window,
@@ -663,9 +758,7 @@ impl ApplicationHandler for App {
                 self.descriptor_set_allocator.clone(),
                 &uniform_buffers,
             ),
-            default_sampler,
             frame_transforms,
-            static_transforms,
             white_image_sampler: white_tex,
             black_image_sampler: black_tex,
             frame_uniform_buffers: uniform_buffers,
@@ -701,16 +794,26 @@ impl ApplicationHandler for App {
                 {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyU) => {
-                            self.cull_backfaces = !self.cull_backfaces;
+                            self.cull_backfaces = self.cull_backfaces.next();
                             println!("Culling: {:?}", self.cull_backfaces);
                         }
                         PhysicalKey::Code(KeyCode::KeyH) => {
-                            self.clockwise_front_face = !self.clockwise_front_face;
+                            self.clockwise_front_face = self.clockwise_front_face.toggle();
                             println!("Winding: {:?}", self.clockwise_front_face);
                         }
                         PhysicalKey::Code(KeyCode::KeyY) => {
-                            let lod_count =
-                                self.rcx.as_ref().unwrap().meshes.read().unwrap().get("viking_room").unwrap().lods.len();
+                            let lod_count = self
+                                .rcx
+                                .as_ref()
+                                .unwrap()
+                                .meshes
+                                .read()
+                                .unwrap()
+                                .get("viking_room")
+                                .unwrap()
+                                .lods
+                                .len();
+
                             self.lod_choice = (self.lod_choice + 1) % lod_count;
                             println!("LOD set to {}", self.lod_choice);
                         }
@@ -770,7 +873,8 @@ fn create_image(
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     allocator: &Arc<StandardMemoryAllocator>,
     value: i32,
-) -> Arc<ImageView> {
+    sampler: Arc<Sampler>,
+) -> Arc<ImageViewSampler> {
     let img = Image::new(
         allocator.clone(),
         ImageCreateInfo {
@@ -822,30 +926,22 @@ fn create_image(
             .unwrap();
     }
 
-    ImageView::new_default(img.clone()).unwrap()
-}
-
-impl RenderContext {
-    fn draw_mesh(&mut self, mesh: Arc<MeshAsset>, transform: TransformTRS, material: Option<u32>) {
-        self.frame_submission.draws.push(DrawSubmission {
-            mesh,
-            transform,
-            override_material: material,
-        });
-    }
+    Arc::new(ImageViewSampler::new(
+        ImageView::new_default(img.clone()).unwrap(),
+        sampler,
+    ))
 }
 
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
-        rcx.frame_submission.draws.clear();
+        rcx.frame_submission.clear_all();
 
-        if let Ok(registry) = rcx.meshes.clone().read() {
-            for t in rcx.static_transforms.clone() {
-                rcx.draw_mesh(registry.get("viking_room").unwrap().clone(), t, None);
-            }
-        }
+        self.scene.update();
 
+        let mut submission = self.scene.resources.get_mut::<FrameSubmission>().unwrap();
+
+        submission.drain_draws_into(&mut rcx.frame_submission.draws);
         rcx.build_frame();
 
         let now = Instant::now();
@@ -879,7 +975,7 @@ impl App {
                     &self.device,
                     &self.memory_allocator,
                     &self.descriptor_set_allocator,
-                    &rcx.default_sampler,
+                    rcx.white_image_sampler.clone(),
                     &new_swapchain_images,
                 );
             rcx.swapchain_pass = swapchain_pass;
@@ -918,7 +1014,6 @@ impl App {
             &self.memory_allocator,
         );
 
-
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
@@ -934,8 +1029,7 @@ impl App {
             let transforms = rcx.frame_transforms[image_index as usize].clone();
 
             if let Ok(mut w) = transforms.write() {
-                w[..required_instances]
-                    .copy_from_slice(&rcx.frame_submission.transforms);
+                w[..required_instances].copy_from_slice(&rcx.frame_submission.transforms);
             }
 
             for draw in &rcx.frame_submission.mesh_draws {
@@ -982,17 +1076,9 @@ impl App {
                 .unwrap()
                 .set_depth_test_enable(true)
                 .unwrap()
-                .set_cull_mode(if self.cull_backfaces {
-                    CullMode::Back
-                } else {
-                    CullMode::Front
-                })
+                .set_cull_mode(self.cull_backfaces.into())
                 .unwrap()
-                .set_front_face(if self.clockwise_front_face {
-                    FrontFace::Clockwise
-                } else {
-                    FrontFace::CounterClockwise
-                })
+                .set_front_face(self.clockwise_front_face.into())
                 .unwrap()
                 .bind_pipeline_graphics(rcx.mrt_pass.predepth_pipeline.clone())
                 .unwrap()
@@ -1013,8 +1099,10 @@ impl App {
                 let set_1 = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     layout.clone(),
-                    [WriteDescriptorSet::buffer(1, rcx.frame_transforms[image_index as usize].clone())
-                    ],
+                    [WriteDescriptorSet::buffer(
+                        1,
+                        rcx.frame_transforms[image_index as usize].clone(),
+                    )],
                     [],
                 )
                 .unwrap();
@@ -1049,13 +1137,6 @@ impl App {
         }
 
         {
-            let layout = rcx
-                .mrt_pass
-                .gbuffer_instanced_pipeline
-                .layout()
-                .set_layouts()[1]
-                .clone();
-
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
                     label_name: "Instanced MRT Geometry".to_string(),
@@ -1113,17 +1194,9 @@ impl App {
                 .unwrap()
                 .set_depth_test_enable(true)
                 .unwrap()
-                .set_cull_mode(if self.cull_backfaces {
-                    CullMode::Back
-                } else {
-                    CullMode::Front
-                })
+                .set_cull_mode(self.cull_backfaces.into())
                 .unwrap()
-                .set_front_face(if self.clockwise_front_face {
-                    FrontFace::Clockwise
-                } else {
-                    FrontFace::CounterClockwise
-                })
+                .set_front_face(self.clockwise_front_face.into())
                 .unwrap()
                 .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_instanced_pipeline.clone())
                 .unwrap()
@@ -1158,14 +1231,17 @@ impl App {
                                 .texture_array
                                 .iter()
                                 .cloned()
-                                .map(|v| (v, rcx.default_sampler.clone()))
+                                .map(|v| (v.view.clone(), rcx.white_image_sampler.sampler.clone()))
                                 .chain(std::iter::repeat((
-                                    rcx.white_image_sampler.clone(),
-                                    rcx.default_sampler.clone(),
+                                    rcx.white_image_sampler.view.clone(),
+                                    rcx.white_image_sampler.sampler.clone(),
                                 )))
                                 .take(256),
                         ),
-                        WriteDescriptorSet::buffer(1, rcx.frame_transforms[image_index as usize].clone()),
+                        WriteDescriptorSet::buffer(
+                            1,
+                            rcx.frame_transforms[image_index as usize].clone(),
+                        ),
                         WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
                         WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
                     ],
@@ -1427,28 +1503,177 @@ impl RenderContext {
         required_instances: usize,
         allocator: &Arc<StandardMemoryAllocator>,
     ) {
-        /* === TRANSFORMS === */
-        {
-            let current = self.frame_transforms[image_index].len() as usize;
+        let current = self.frame_transforms[image_index].len() as usize;
 
-            if current < required_instances {
-                let new_capacity = required_instances.next_power_of_two();
+        if current < required_instances {
+            let new_capacity = required_instances.next_power_of_two();
 
-                self.frame_transforms[image_index] = Buffer::new_slice::<TransformTRS>(
-                    allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                        ..Default::default()
-                    },
-                    new_capacity as DeviceSize,
-                )
-                .unwrap();
-            }
+            self.frame_transforms[image_index] = Buffer::new_slice::<TransformTRS>(
+                allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                new_capacity as DeviceSize,
+            )
+            .unwrap();
+        }
+    }
+}
+
+mod predepth {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            vulkan_version: "1.3",
+            spirv_version: "1.6",
+            path: "assets/shaders/predepth.vert",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                #version 450
+                void main() { }
+            "
+        }
+    }
+}
+
+mod mrt {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            vulkan_version: "1.3",
+            spirv_version: "1.6",
+            path: "assets/shaders/instanced_mrt.vert",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            vulkan_version: "1.3",
+            spirv_version: "1.6",
+            path: "./assets/shaders/instanced_mrt.frag",
+            include: ["./assets/shaders/include"],
+        }
+    }
+}
+
+mod fullscreen {
+
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                        #version 450
+                        layout(location = 0) out vec2 uvs;
+                        void main() {
+                            uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+                            gl_Position = vec4(uvs * 2.0 - 1.0, 0.0, 1.0);
+                        }
+                    ",
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                        #version 450
+                        layout(location = 0) in vec2 uvs;
+                        layout(location = 0) out vec4 f_color;
+
+                        layout(set=0, binding=0) uniform sampler2D composite_output;
+
+                        vec3 aces(vec3 x) {
+                            return clamp((x*(2.51*x+0.03)) / (x*(2.43*x+0.59)+0.14), 0.0, 1.0);
+                        }
+
+                        vec3 linear_to_srgb(vec3 x){
+                            return pow(x, vec3(1.0/2.2));
+                        }
+
+                        void main(){
+                            vec3 color = texture(composite_output, uvs).xyz;
+                            color = linear_to_srgb(aces(color));
+                            f_color = vec4(color,1.0);
+                        }
+                    ",
+        }
+    }
+}
+
+mod composite {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                        #version 450
+                        layout(location = 0) out vec2 v_uvs;
+                        void main(){
+                            v_uvs = vec2((gl_VertexIndex<<1)&2, gl_VertexIndex&2);
+                            gl_Position = vec4(v_uvs*2.0 + -1.0,0.0,1.0);
+                        }
+                    "
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            src: r"
+                        #version 450
+
+                        layout(location = 0) in vec2 v_uvs;
+                        layout(location = 0) out vec4 out_color;
+
+                        layout(set=0, binding=0) uniform sampler2D hdr_tex;
+                        layout(set=0, binding=1) uniform sampler2D bloom_tex;
+
+                        layout (push_constant) uniform PC {
+                            float bloom_strength;
+                        };
+
+                        void main() {
+                            vec3 hdr = texture(hdr_tex, v_uvs).rgb;
+                            vec3 bloom = texture(bloom_tex, v_uvs).rgb;
+
+                            float bloom_final_strength = max(bloom_strength, 1.0);
+                            out_color = vec4(hdr + bloom * bloom_final_strength, 1.0);
+                        }
+                    "
+        }
+    }
+}
+
+mod mrt_light {
+    pub mod vs {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            src: r"
+                        #version 450
+                        layout(location = 0) out vec2 v_uvs;
+                        void main() {
+                            v_uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+                            gl_Position = vec4(v_uvs * 2.0 + -1.0, 0.0, 1.0);
+                        }
+                    "
+        }
+    }
+
+    pub mod fs {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "assets/shaders/mrt_lighting.frag",
         }
     }
 }
@@ -1457,34 +1682,15 @@ fn window_size_dependent_setup(
     device: &Arc<Device>,
     memory_allocator: &Arc<GenericMemoryAllocator<FreeListAllocator>>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-    default_sampler: &Arc<Sampler>,
+    default_white_texture: Arc<ImageViewSampler>,
     swapchain_images: &[Arc<Image>],
 ) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
     let predepth_pipeline = {
-        mod vs {
-            vulkano_shaders::shader! {
-                ty: "vertex",
-                vulkan_version: "1.3",
-                spirv_version: "1.6",
-                path: "assets/shaders/predepth.vert",
-            }
-        }
-
-        mod fs {
-            vulkano_shaders::shader! {
-                ty: "fragment",
-                src: r"
-                #version 450
-                void main() { }
-            "
-            }
-        }
-
-        let vs = vs::load(device.clone())
+        let vs = predepth::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = fs::load(device.clone())
+        let fs = predepth::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -1560,30 +1766,11 @@ fn window_size_dependent_setup(
     };
 
     let mrt_instanced_pipeline = {
-        mod vs {
-            vulkano_shaders::shader! {
-                ty: "vertex",
-                vulkan_version: "1.3",
-                spirv_version: "1.6",
-                path: "assets/shaders/instanced_mrt.vert",
-            }
-        }
-
-        mod fs {
-            vulkano_shaders::shader! {
-                ty: "fragment",
-                vulkan_version: "1.3",
-                spirv_version: "1.6",
-                path: "./assets/shaders/instanced_mrt.frag",
-                include: ["./assets/shaders/include"],
-            }
-        }
-
-        let vs = vs::load(device.clone())
+        let vs = mrt::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = fs::load(device.clone())
+        let fs = mrt::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -1781,154 +1968,129 @@ fn window_size_dependent_setup(
     // === MRT LIGHTING PASS (UBO + GBUFFER INPUT)
     // ==============================================================
     let mrt_lighting = {
-        let pass = {
-            mod vs {
-                vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
-                        #version 450
-                        layout(location = 0) out vec2 v_uvs;
-                        void main() {
-                            v_uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-                            gl_Position = vec4(v_uvs * 2.0 + -1.0, 0.0, 1.0);
-                        }
-                    "
-                }
-            }
-
-            mod fs {
-                vulkano_shaders::shader! {
-                    ty: "fragment",
-                    path: "assets/shaders/mrt_lighting.frag",
-                }
-            }
-
-            let vs = vs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-            let fs = fs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-
-            let set_layout_ubo =
-                DescriptorSetLayout::new(device.clone(), renderer_set_0_layouts()[0].clone())
-                    .unwrap(); // UBO layout
-
-            let set_layout_gb = DescriptorSetLayout::new(
-                device.clone(),
-                DescriptorSetLayoutCreateInfo {
-                    bindings: BTreeMap::from([
-                        (0, {
-                            let mut bind =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            bind.stages = ShaderStages::FRAGMENT;
-
-                            bind
-                        }),
-                        (1, {
-                            let mut bind =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            bind.stages = ShaderStages::FRAGMENT;
-
-                            bind
-                        }),
-                        (2, {
-                            let mut bind =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            bind.stages = ShaderStages::FRAGMENT;
-
-                            bind
-                        }),
-                        (3, {
-                            let mut bind =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            bind.stages = ShaderStages::FRAGMENT;
-
-                            bind
-                        }),
-                    ]),
-                    ..Default::default()
-                },
-            )
+        let vs = mrt_light::vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = mrt_light::fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
             .unwrap();
 
-            let gb_set = DescriptorSet::new(
-                descriptor_set_allocator.clone(),
-                set_layout_gb.clone(),
-                [
-                    WriteDescriptorSet::image_view_sampler(
-                        0,
-                        mrt.gbuffer_image_views[0].clone(),
-                        default_sampler.clone(),
-                    ),
-                    WriteDescriptorSet::image_view_sampler(
-                        1,
-                        mrt.gbuffer_image_views[1].clone(),
-                        default_sampler.clone(),
-                    ),
-                    WriteDescriptorSet::image_view_sampler(
-                        2,
-                        mrt.gbuffer_image_views[2].clone(),
-                        default_sampler.clone(),
-                    ),
-                    WriteDescriptorSet::image_view_sampler(
-                        3,
-                        mrt.gbuffer_depth_view.clone(),
-                        default_sampler.clone(),
-                    ),
-                ],
-                [],
-            )
-            .unwrap();
+        let set_layout_ubo =
+            DescriptorSetLayout::new(device.clone(), renderer_set_0_layouts()[0].clone()).unwrap(); // UBO layout
 
-            let layout = PipelineLayout::new(
-                device.clone(),
-                PipelineLayoutCreateInfo {
-                    set_layouts: vec![set_layout_ubo.clone(), set_layout_gb.clone()],
-                    push_constant_ranges: vec![],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let set_layout_gb = DescriptorSetLayout::new(
+            device.clone(),
+            DescriptorSetLayoutCreateInfo {
+                bindings: BTreeMap::from([
+                    (0, {
+                        let mut bind =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        bind.stages = ShaderStages::FRAGMENT;
 
-            let stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ];
+                        bind
+                    }),
+                    (1, {
+                        let mut bind =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        bind.stages = ShaderStages::FRAGMENT;
 
-            let subpass = PipelineRenderingCreateInfo {
-                color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
+                        bind
+                    }),
+                    (2, {
+                        let mut bind =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        bind.stages = ShaderStages::FRAGMENT;
+
+                        bind
+                    }),
+                    (3, {
+                        let mut bind =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        bind.stages = ShaderStages::FRAGMENT;
+
+                        bind
+                    }),
+                ]),
                 ..Default::default()
-            };
+            },
+        )
+        .unwrap();
 
-            let mut ci = GraphicsPipelineCreateInfo::layout(layout.clone());
-            ci.vertex_input_state = Some(VertexInputState::new());
-            ci.input_assembly_state = Some(InputAssemblyState::default());
-            ci.viewport_state = Some(ViewportState::default());
-            ci.rasterization_state = Some(RasterizationState::default());
-            ci.multisample_state = Some(MultisampleState::default());
-            ci.color_blend_state = Some(ColorBlendState {
-                attachments: [ColorBlendAttachmentState::default()].to_vec(),
+        let gb_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            set_layout_gb.clone(),
+            [
+                WriteDescriptorSet::image_view_sampler(
+                    0,
+                    mrt.gbuffer_image_views[0].clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    mrt.gbuffer_image_views[1].clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    2,
+                    mrt.gbuffer_image_views[2].clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    3,
+                    mrt.gbuffer_depth_view.clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![set_layout_ubo.clone(), set_layout_gb.clone()],
+                push_constant_ranges: vec![],
                 ..Default::default()
-            });
-            ci.subpass = Some(subpass.into());
-            ci.stages.push(stages[0].clone());
-            ci.stages.push(stages[1].clone());
-            ci.dynamic_state.insert(DynamicState::Viewport);
-            ci.dynamic_state.insert(DynamicState::Scissor);
-            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
-            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
-            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+            },
+        )
+        .unwrap();
 
-            MRTLighting {
-                pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
-                set: gb_set,
-                image_view: ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
-            }
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let subpass = PipelineRenderingCreateInfo {
+            color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
+            ..Default::default()
         };
-        pass
+
+        let mut ci = GraphicsPipelineCreateInfo::layout(layout.clone());
+        ci.vertex_input_state = Some(VertexInputState::new());
+        ci.input_assembly_state = Some(InputAssemblyState::default());
+        ci.viewport_state = Some(ViewportState::default());
+        ci.rasterization_state = Some(RasterizationState::default());
+        ci.multisample_state = Some(MultisampleState::default());
+        ci.color_blend_state = Some(ColorBlendState {
+            attachments: [ColorBlendAttachmentState::default()].to_vec(),
+            ..Default::default()
+        });
+        ci.subpass = Some(subpass.into());
+        ci.stages.push(stages[0].clone());
+        ci.stages.push(stages[1].clone());
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+        ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+
+        MRTLighting {
+            pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
+            set: gb_set,
+            image_view: ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
+        }
     };
 
     // ==============================================================
@@ -1954,291 +2116,202 @@ fn window_size_dependent_setup(
     .unwrap();
 
     let composite = {
-        let pass = {
-            mod vs {
-                vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
-                        #version 450
-                        layout(location = 0) out vec2 v_uvs;
-                        void main(){
-                            v_uvs = vec2((gl_VertexIndex<<1)&2, gl_VertexIndex&2);
-                            gl_Position = vec4(v_uvs*2.0 + -1.0,0.0,1.0);
-                        }
-                    "
-                }
-            }
-
-            mod fs {
-                vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
-                        #version 450
-
-                        layout(location = 0) in vec2 v_uvs;
-                        layout(location = 0) out vec4 out_color;
-
-                        layout(set=0, binding=0) uniform sampler2D hdr_tex;
-                        layout(set=0, binding=1) uniform sampler2D bloom_tex;
-
-                        layout (push_constant) uniform PC {
-                            float bloom_strength;
-                        };
-
-                        void main() {
-                            vec3 hdr = texture(hdr_tex, v_uvs).rgb;
-                            vec3 bloom = texture(bloom_tex, v_uvs).rgb;
-
-                            float bloom_final_strength = max(bloom_strength, 1.0);
-                            out_color = vec4(hdr + bloom * bloom_final_strength, 1.0);
-                        }
-                    "
-                }
-            }
-
-            let vs = vs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-            let fs = fs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-
-            let set_layout = DescriptorSetLayout::new(
-                device.clone(),
-                DescriptorSetLayoutCreateInfo {
-                    bindings: BTreeMap::from([
-                        (0, {
-                            let mut b =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            b.stages = ShaderStages::FRAGMENT;
-                            b
-                        }),
-                        (1, {
-                            let mut b =
-                                DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                            b.stages = ShaderStages::FRAGMENT;
-                            b
-                        }),
-                    ]),
-                    ..Default::default()
-                },
-            )
+        let vs = composite::vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = composite::fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
             .unwrap();
 
-            let set = DescriptorSet::new(
-                descriptor_set_allocator.clone(),
-                set_layout.clone(),
-                [
-                    WriteDescriptorSet::image_view_sampler(
-                        0,
-                        ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
-                        default_sampler.clone(),
-                    ),
-                    WriteDescriptorSet::image_view_sampler(
-                        1,
-                        bloom_pass.result(), // bloom mip 0 (after upsample accumulation)
-                        default_sampler.clone(),
-                    ),
-                ],
-                [],
-            )
-            .unwrap();
-            let layout = PipelineLayout::new(
-                device.clone(),
-                PipelineLayoutCreateInfo {
-                    set_layouts: vec![set_layout.clone()],
-                    push_constant_ranges: [PushConstantRange {
-                        stages: ShaderStages::FRAGMENT,
-                        offset: 0,
-                        size: std::mem::size_of::<fs::PC>() as _,
-                    }]
-                    .to_vec(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-            let stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ];
-
-            let subpass = PipelineRenderingCreateInfo {
-                color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
+        let set_layout = DescriptorSetLayout::new(
+            device.clone(),
+            DescriptorSetLayoutCreateInfo {
+                bindings: BTreeMap::from([
+                    (0, {
+                        let mut b =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        b.stages = ShaderStages::FRAGMENT;
+                        b
+                    }),
+                    (1, {
+                        let mut b =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        b.stages = ShaderStages::FRAGMENT;
+                        b
+                    }),
+                ]),
                 ..Default::default()
-            };
+            },
+        )
+        .unwrap();
 
-            let mut ci = GraphicsPipelineCreateInfo::layout(layout);
-            ci.vertex_input_state = Some(VertexInputState::new());
-            ci.input_assembly_state = Some(InputAssemblyState::default());
-            ci.viewport_state = Some(ViewportState::default());
-            ci.rasterization_state = Some(RasterizationState::default());
-            ci.color_blend_state = Some(ColorBlendState {
-                attachments: [ColorBlendAttachmentState::default()].to_vec(),
+        let set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            set_layout.clone(),
+            [
+                WriteDescriptorSet::image_view_sampler(
+                    0,
+                    ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    bloom_pass.result(), // bloom mip 0 (after upsample accumulation)
+                    default_white_texture.sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![set_layout.clone()],
+                push_constant_ranges: [PushConstantRange {
+                    stages: ShaderStages::FRAGMENT,
+                    offset: 0,
+                    size: std::mem::size_of::<composite::fs::PC>() as _,
+                }]
+                .to_vec(),
                 ..Default::default()
-            });
-            ci.multisample_state = Some(MultisampleState::default());
-            ci.subpass = Some(subpass.into());
-            ci.stages.push(stages[0].clone());
-            ci.stages.push(stages[1].clone());
-            ci.dynamic_state.insert(DynamicState::Viewport);
-            ci.dynamic_state.insert(DynamicState::Scissor);
-            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
-            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
-            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+            },
+        )
+        .unwrap();
 
-            Composite {
-                pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
-                set,
-                image_view: ImageView::new_default(composite_image.clone()).unwrap(),
-            }
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let subpass = PipelineRenderingCreateInfo {
+            color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
+            ..Default::default()
         };
-        pass
+
+        let mut ci = GraphicsPipelineCreateInfo::layout(layout);
+        ci.vertex_input_state = Some(VertexInputState::new());
+        ci.input_assembly_state = Some(InputAssemblyState::default());
+        ci.viewport_state = Some(ViewportState::default());
+        ci.rasterization_state = Some(RasterizationState::default());
+        ci.color_blend_state = Some(ColorBlendState {
+            attachments: [ColorBlendAttachmentState::default()].to_vec(),
+            ..Default::default()
+        });
+        ci.multisample_state = Some(MultisampleState::default());
+        ci.subpass = Some(subpass.into());
+        ci.stages.push(stages[0].clone());
+        ci.stages.push(stages[1].clone());
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+        ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+        Composite {
+            pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
+            set,
+            image_view: ImageView::new_default(composite_image.clone()).unwrap(),
+        }
     };
 
     // ==============================================================
     // === SWAPCHAIN PASS (unchanged)
     // ==============================================================
     let swapchain_pass = {
-        let pass = {
-            mod vs_fullscreen {
-                vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
-                        #version 450
-                        layout(location = 0) out vec2 uvs;
-                        void main() {
-                            uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-                            gl_Position = vec4(uvs * 2.0 - 1.0, 0.0, 1.0);
-                        }
-                    ",
-                }
-            }
+        let vs = fullscreen::vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = fullscreen::fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
 
-            mod fs_fullscreen {
-                vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
-                        #version 450
-                        layout(location = 0) in vec2 uvs;
-                        layout(location = 0) out vec4 f_color;
-
-                        layout(set=0, binding=0) uniform sampler2D composite_output;
-
-                        vec3 aces(vec3 x) {
-                            return clamp((x*(2.51*x+0.03)) / (x*(2.43*x+0.59)+0.14), 0.0, 1.0);
-                        }
-
-                        vec3 linear_to_srgb(vec3 x){
-                            return pow(x, vec3(1.0/2.2));
-                        }
-
-                        void main(){
-                            vec3 color = texture(composite_output, uvs).xyz;
-                            color = linear_to_srgb(aces(color));
-                            f_color = vec4(color,1.0);
-                        }
-                    ",
-                }
-            }
-
-            let vs = vs_fullscreen::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-            let fs = fs_fullscreen::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-
-            let mut composite_image = DescriptorSetLayoutCreateInfo::default();
-            composite_image.bindings.insert(0, {
-                let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-                bind.stages = ShaderStages::FRAGMENT;
-                bind
-            });
-
-            let mut ci = GraphicsPipelineCreateInfo::layout({
-                let info = PipelineDescriptorSetLayoutCreateInfo {
-                    flags: Default::default(),
-                    set_layouts: [composite_image].into(),
-                    push_constant_ranges: vec![],
-                };
-                PipelineLayout::new(
-                    device.clone(),
-                    info.into_pipeline_layout_create_info(device.clone())
-                        .unwrap(),
-                )
-                .unwrap()
-            });
-
-            ci.input_assembly_state = Some(InputAssemblyState::default());
-            ci.vertex_input_state = Some(VertexInputState::new());
-            ci.viewport_state = Some(ViewportState::default());
-            ci.rasterization_state = Some(RasterizationState::default());
-            ci.multisample_state = Some(MultisampleState::default());
-            ci.color_blend_state = Some(ColorBlendState {
-                attachments: [ColorBlendAttachmentState::default()].to_vec(),
-                ..Default::default()
-            });
-            ci.subpass = Some(
-                PipelineRenderingCreateInfo {
-                    color_attachment_formats: vec![Some(Format::B8G8R8A8_SRGB)],
-                    ..Default::default()
-                }
-                .into(),
-            );
-            ci.stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ]
-            .into_iter()
-            .collect();
-            ci.dynamic_state.insert(DynamicState::Viewport);
-            ci.dynamic_state.insert(DynamicState::Scissor);
-            ci.dynamic_state.insert(DynamicState::DepthTestEnable);
-            ci.dynamic_state.insert(DynamicState::DepthCompareOp);
-            ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
-
-            let pipeline = GraphicsPipeline::new(device.clone(), None, ci).unwrap();
-
+        let mut composite_image = DescriptorSetLayoutCreateInfo::default();
+        composite_image.bindings.insert(0, {
             let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
             bind.stages = ShaderStages::FRAGMENT;
+            bind
+        });
 
-            let descriptor_layout = DescriptorSetLayout::new(
+        let mut ci = GraphicsPipelineCreateInfo::layout({
+            let info = PipelineDescriptorSetLayoutCreateInfo {
+                flags: Default::default(),
+                set_layouts: [composite_image].into(),
+                push_constant_ranges: vec![],
+            };
+            PipelineLayout::new(
                 device.clone(),
-                DescriptorSetLayoutCreateInfo {
-                    flags: Default::default(),
-                    bindings: BTreeMap::from([(0, bind)]),
-                    ..Default::default()
-                },
+                info.into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
             )
-            .unwrap();
+            .unwrap()
+        });
 
-            let set = DescriptorSet::new(
-                descriptor_set_allocator.clone(),
-                descriptor_layout.clone(),
-                [WriteDescriptorSet::image_view_sampler(
-                    0,
-                    composite.image_view.clone(),
-                    default_sampler.clone(),
-                )],
-                [],
-            )
-            .unwrap();
-
-            SwapchainPass {
-                pipeline,
-                set,
-                attachment_image_views: swapchain_images
-                    .iter()
-                    .map(|i| ImageView::new_default(i.clone()).unwrap())
-                    .collect(),
+        ci.input_assembly_state = Some(InputAssemblyState::default());
+        ci.vertex_input_state = Some(VertexInputState::new());
+        ci.viewport_state = Some(ViewportState::default());
+        ci.rasterization_state = Some(RasterizationState::default());
+        ci.multisample_state = Some(MultisampleState::default());
+        ci.color_blend_state = Some(ColorBlendState {
+            attachments: [ColorBlendAttachmentState::default()].to_vec(),
+            ..Default::default()
+        });
+        ci.subpass = Some(
+            PipelineRenderingCreateInfo {
+                color_attachment_formats: vec![Some(Format::B8G8R8A8_SRGB)],
+                ..Default::default()
             }
-        };
-        pass
+            .into(),
+        );
+        ci.stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ]
+        .into_iter()
+        .collect();
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::DepthCompareOp);
+        ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
+
+        let pipeline = GraphicsPipeline::new(device.clone(), None, ci).unwrap();
+
+        let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+        bind.stages = ShaderStages::FRAGMENT;
+
+        let descriptor_layout = DescriptorSetLayout::new(
+            device.clone(),
+            DescriptorSetLayoutCreateInfo {
+                flags: Default::default(),
+                bindings: BTreeMap::from([(0, bind)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            descriptor_layout.clone(),
+            [WriteDescriptorSet::image_view_sampler(
+                0,
+                composite.image_view.clone(),
+                default_white_texture.sampler.clone(),
+            )],
+            [],
+        )
+        .unwrap();
+
+        SwapchainPass {
+            pipeline,
+            set,
+            attachment_image_views: swapchain_images
+                .iter()
+                .map(|i| ImageView::new_default(i.clone()).unwrap())
+                .collect(),
+        }
     };
 
     // let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
@@ -2246,10 +2319,7 @@ fn window_size_dependent_setup(
     (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass)
 }
 
-fn update_material_ids_for_mesh(
-    mesh: &MeshAsset,
-    material_ids: &mut [u32],
-) {
+fn update_material_ids_for_mesh(mesh: &MeshAsset, material_ids: &mut [u32]) {
     let mut draw_id = 0;
 
     for _lod in 0..mesh.lods.len() {

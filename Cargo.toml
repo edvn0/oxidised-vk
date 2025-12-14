@@ -16,3 +16,4 @@ ordered-float = "5.1.0"
 image = "0.25.9"
 gltf = "1.4.1"
 meshopt-rs = {version="0.1.2", features=["experimental"]}
+legion = "0.4.0"

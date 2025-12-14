@@ -1,6 +1,5 @@
 use crate::texture_cache::{BindlessTextureIndex, TextureCache};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
-use gltf::json::extensions::mesh::Mesh;
 use meshopt_rs::vertex::Position;
 use meshopt_rs::{
     overdraw::optimize_overdraw,
@@ -8,7 +7,6 @@ use meshopt_rs::{
     vertex::{cache::optimize_vertex_cache, fetch::optimize_vertex_fetch},
 };
 use nalgebra::{Matrix4, Vector3, Vector4};
-use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, RwLock};
 use vulkano::{
@@ -23,6 +21,10 @@ use vulkano::{
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     sync::GpuFuture,
 };
+use vulkano::command_buffer::{BlitImageInfo, ImageBlit};
+use vulkano::device::DeviceOwned;
+use vulkano::image::{ImageAspects, ImageSubresourceLayers};
+use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
 use crate::mesh_registry::MeshRegistry;
 
 #[derive(Debug)]
@@ -67,6 +69,19 @@ pub struct GpuMaterial {
 }
 
 #[derive(Eq, Hash, PartialEq)]
+pub(crate) struct ImageViewSampler {
+    pub view: Arc<ImageView>,
+    pub sampler: Arc<Sampler>,
+}
+
+impl ImageViewSampler {
+    pub fn new(   view: Arc<ImageView>,
+                  sampler: Arc<Sampler>)  -> Self {
+        Self {view,sampler}
+    }
+}
+
+#[derive(Eq, Hash, PartialEq)]
 pub struct MeshAsset {
     pub vertex_buffer: Subbuffer<[StandardMeshVertex]>,
     pub position_vertex_buffer: Subbuffer<[PositionMeshVertex]>,
@@ -76,13 +91,7 @@ pub struct MeshAsset {
     pub lods: Vec<MeshLod>,
 
     pub materials_buffer: Subbuffer<[GpuMaterial]>,
-    pub texture_array: Vec<Arc<ImageView>>,
-}
-
-impl MeshAsset {
-    pub fn index_count(&self) -> u32 {
-        self.index_buffer.len() as u32
-    }
+    pub texture_array: Vec<Arc<ImageViewSampler>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,7 +113,6 @@ pub struct BuildMesh {
     pub lod_indices: Vec<Vec<u32>>,
     pub submeshes: Vec<SubmeshCpu>,
     pub materials: Vec<MaterialAsset>,
-    pub generate_lods: bool,
 }
 
 pub struct SubmeshCpu {
@@ -158,7 +166,7 @@ impl MaterialAsset {
 
 pub fn upload_build_mesh(
     build: BuildMesh,
-    texture_array: Vec<Arc<ImageView>>,
+    texture_array: Vec<Arc<ImageViewSampler>>,
     allocator: &Arc<StandardMemoryAllocator>,
 ) -> Result<Arc<MeshAsset>, MeshLoadError> {
     assert!(!build.vertices.is_empty());
@@ -300,16 +308,15 @@ pub fn import_gltf(
     allocator: &Arc<StandardMemoryAllocator>,
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     queue: &Arc<Queue>,
-    white_texture: &Arc<ImageView>,
-    generate_lods: bool,
-) -> Result<(BuildMesh, Vec<Arc<ImageView>>), MeshLoadError> {
+    white_texture: Arc<ImageViewSampler>,
+) -> Result<(BuildMesh, Vec<Arc<ImageViewSampler>>), MeshLoadError> {
     let (gltf, buffers, images) = gltf::import(path)?;
 
     let mut texture_array = Vec::new();
     let mut texture_cache = TextureCache::new(BindlessTextureIndex::WHITE);
 
     // index 0 = white texture
-    texture_array.push(white_texture.clone());
+    texture_array.push(white_texture);
 
     // real textures start at 1
     for (i, img) in images.iter().enumerate() {
@@ -351,7 +358,6 @@ pub fn import_gltf(
             lod_indices: lods,
             submeshes,
             materials,
-            generate_lods,
         },
         texture_array,
     ))
@@ -373,12 +379,16 @@ fn build_gltf_material_cpu(material: &gltf::Material, cache: &TextureCache) -> M
     )
 }
 
+fn mip_count(width: u32, height: u32) -> u32 {
+    (width.max(height) as f32).log2().floor() as u32 + 1
+}
+
 fn upload_gltf_image(
     img: &gltf::image::Data,
     allocator: &Arc<StandardMemoryAllocator>,
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     queue: &Arc<Queue>,
-) -> Result<Arc<ImageView>, MeshLoadError> {
+) -> Result<Arc<ImageViewSampler>, MeshLoadError> {
     let (pixels, format) = match img.format {
         gltf::image::Format::R8G8B8A8 => (img.pixels.clone(), Format::R8G8B8A8_SRGB),
 
@@ -408,19 +418,23 @@ fn upload_gltf_image(
     )
     .unwrap();
 
+    let mip_levels = mip_count(img.width, img.height);
     let image = Image::new(
         allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
             extent: [img.width, img.height, 1],
+            mip_levels,
             format,
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            usage: ImageUsage::TRANSFER_DST
+                | ImageUsage::TRANSFER_SRC
+                | ImageUsage::SAMPLED,
             initial_layout: ImageLayout::Undefined,
             ..Default::default()
         },
         AllocationCreateInfo::default(),
     )
-    .unwrap();
+        .unwrap();
 
     let mut cb = AutoCommandBufferBuilder::primary(
         cb_allocator.clone(),
@@ -428,9 +442,45 @@ fn upload_gltf_image(
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
+    cb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging.clone(), image.clone())).unwrap();
 
-    cb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
+    /* === Generate mip chain === */
+    let mut width = img.width as i32;
+    let mut height = img.height as i32;
+
+    for level in 1..mip_levels {
+        cb.blit_image(BlitImageInfo {
+            regions: [ImageBlit {
+                src_subresource: ImageSubresourceLayers {
+                    aspects: ImageAspects::COLOR,
+                    mip_level: level - 1,
+                    array_layers: 0..1,
+                },
+                src_offsets: [[0, 0, 0], [width as u32, height as u32, 1]],
+                dst_subresource: ImageSubresourceLayers {
+                    aspects: ImageAspects::COLOR,
+                    mip_level: level,
+                    array_layers: 0..1,
+                },
+                dst_offsets: [
+                    [0, 0, 0],
+                    [
+                        (width / 2).max(1) as u32,
+                        (height / 2).max(1) as u32,
+                        1,
+                    ],
+                ],
+                ..Default::default()
+            }]
+                .into(),
+            filter: Filter::Linear,
+            ..BlitImageInfo::images(image.clone(), image.clone())
+        })
         .unwrap();
+
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
 
     cb.build()
         .unwrap()
@@ -441,7 +491,9 @@ fn upload_gltf_image(
         .wait(None)
         .unwrap();
 
-    Ok(ImageView::new_default(image).unwrap())
+    let sampler = Sampler::new(allocator.device().clone(), SamplerCreateInfo{ lod: 0.0..=(mip_levels as f32), ..SamplerCreateInfo::default() }).unwrap();
+
+    Ok(Arc::new(ImageViewSampler::new(ImageView::new_default(image).unwrap(), sampler)))
 }
 
 pub fn generate_lods_meshopt(
@@ -484,53 +536,54 @@ pub fn load_meshes_from_directory(
     allocator: &Arc<StandardMemoryAllocator>,
     command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
     graphics_queue: &Arc<Queue>,
-    white_tex: &Arc<ImageView>,
+    white_tex: Arc<ImageViewSampler>,
 ) -> Arc<RwLock<MeshRegistry>> {
-    let mut meshes = HashMap::new();
 
     let mut entries: Vec<_> = fs::read_dir(dir)
         .unwrap()
         .filter_map(Result::ok)
         .collect();
 
+
+    let registry = Arc::new(RwLock::new(MeshRegistry::new(Default::default())));
+    if let Ok(mut write_guard) =registry.write() {
     entries.sort_by_key(|e| e.path());
+        for entry in entries {
+            let path = entry.path();
 
-    for entry in entries {
-        let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
 
-        if !path.is_file() {
-            continue;
+            let ext = path.extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("gltf") | Some("glb")) {
+                continue;
+            }
+
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap()
+                .to_string();
+
+            let path_str = path.to_str().unwrap();
+
+            let (build, images) = import_gltf(
+                path_str,
+                allocator,
+                command_buffer_allocator,
+                graphics_queue,
+                white_tex.clone(),
+            )
+                .unwrap();
+
+            let mesh = upload_build_mesh(build, images, allocator).unwrap();
+
+            write_guard.insert(name, mesh);
         }
-
-        let ext = path.extension().and_then(|e| e.to_str());
-        if !matches!(ext, Some("gltf") | Some("glb")) {
-            continue;
-        }
-
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap()
-            .to_string();
-
-        let path_str = path.to_str().unwrap();
-
-        let (build, images) = import_gltf(
-            path_str,
-            allocator,
-            command_buffer_allocator,
-            graphics_queue,
-            white_tex,
-            false,
-        )
-            .unwrap();
-
-        let mesh = upload_build_mesh(build, images, allocator).unwrap();
-
-        meshes.insert(name, mesh);
     }
 
-    Arc::new(RwLock::new(MeshRegistry::new(meshes)))
+    registry
 }
 
 fn process_node(
