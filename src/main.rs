@@ -2,6 +2,7 @@ extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
 mod components;
+mod imgui;
 mod input_state;
 mod main_helpers;
 mod math;
@@ -15,6 +16,7 @@ mod vertex;
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
 use crate::components::{MeshComponent, Transform, Visible};
+use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
@@ -22,9 +24,9 @@ use crate::mesh_registry::MeshRegistry;
 use crate::scene::Scene;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
-use nalgebra::{Matrix4, Translation3};
-use imgui::{Condition, Context};
+use ::imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
+use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
@@ -292,7 +294,7 @@ struct RenderContext {
 
     winit_platform: WinitPlatform,
     imgui_context: Context,
-    imgui_renderer: (),
+    imgui_renderer: ImGuiRenderer,
 }
 
 impl RenderContext {
@@ -505,6 +507,22 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
 }
 
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let rcx = self.rcx.as_mut().unwrap();
+
+        let now = Instant::now();
+        let delta = now - self.last_frame;
+        self.last_frame = now;
+
+        rcx.imgui_context.io_mut().update_delta_time(delta);
+
+        rcx.winit_platform
+            .prepare_frame(rcx.imgui_context.io_mut(), rcx.window.as_ref())
+            .expect("imgui prepare_frame");
+
+        rcx.window.request_redraw();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attribs = Window::default_attributes();
         attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
@@ -749,8 +767,22 @@ impl ApplicationHandler for App {
             ));
         }
 
-
         let mut imgui = Context::create();
+        imgui.set_ini_filename(None);
+
+        let mut renderer = ImGuiRenderer::new(
+            self.device.clone(),
+            self.memory_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            swapchain.image_format(),
+            swapchain.image_count() as usize,
+        );
+
+        renderer.upload_font_atlas(
+            &mut imgui,
+            self.graphics_queue.clone(),
+            self.command_buffer_allocator.clone(),
+        );
 
         let mut platform = WinitPlatform::new(&mut imgui); // step 1
         platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
@@ -790,7 +822,7 @@ impl ApplicationHandler for App {
 
             winit_platform: platform,
             imgui_context: imgui,
-            imgui_renderer: (),
+            imgui_renderer: renderer,
         });
     }
 
@@ -800,6 +832,17 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        let rcx = self.rcx.as_mut().unwrap();
+
+        rcx.winit_platform.handle_event(
+            rcx.imgui_context.io_mut(),
+            rcx.window.as_ref(),
+            &winit::event::Event::WindowEvent::<()> {
+                window_id: rcx.window.id(),
+                event: event.clone(),
+            },
+        );
+
         match &event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -871,16 +914,11 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.input_state.rotating
         {
-            self.input_state.mouse_delta = (delta.0 as f32, delta.1 as f32);
+            self.input_state.mouse_delta = (dx as f32, dy as f32);
         }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let rcx = self.rcx.as_mut().unwrap();
-        rcx.window.request_redraw();
     }
 }
 
@@ -966,7 +1004,6 @@ impl App {
                 ));
             });
         rcx.winit_platform.prepare_render(ui, &rcx.window); // step 5
-        rcx.imgui_context.render();
 
         rcx.frame_submission.clear_all();
 
@@ -1461,7 +1498,49 @@ impl App {
                     .unwrap()
                     .end_debug_utils_label()
                     .unwrap();
-            };
+            }
+        }
+
+        {
+            // IMGUI now?
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "ImGui Render".to_string(),
+                    color: [0.5, 0.5, 0.5, 1.0],
+                    ..Default::default()
+                })
+                .unwrap()
+                .begin_rendering(RenderingInfo {
+                    render_area_extent: rcx.scissor.extent,
+                    render_area_offset: rcx.scissor.offset,
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_value: None,
+                        ..RenderingAttachmentInfo::image_view(
+                            rcx.swapchain_pass.attachment_image_views[image_index as usize].clone(),
+                        )
+                    })],
+                    ..Default::default()
+                })
+                .unwrap();
+
+        let draw_data =     rcx.imgui_context.render();
+
+            rcx.imgui_renderer
+                .draw(
+                    &mut graphics_builder,
+                    draw_data,
+                    image_index as usize,
+                );
+
+            unsafe {
+                graphics_builder
+                    .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
+                    .unwrap();
+            }
         }
 
         let cmd_buf = graphics_builder.build().unwrap();
