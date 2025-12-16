@@ -28,6 +28,8 @@ use ::imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
+use vulkano::descriptor_set::pool::DescriptorPoolCreateFlags;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::RwLock;
@@ -425,6 +427,11 @@ impl App {
                     descriptor_binding_partially_bound: true,
                     shader_sampled_image_array_non_uniform_indexing: true,
                     shader_sampled_image_array_dynamic_indexing: true,
+                    descriptor_binding_sampled_image_update_after_bind: true,
+                    shader_int64: true,
+                    shader_int16: true,
+                    shader_int8: true,
+                    shader_float16: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -442,8 +449,10 @@ impl App {
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
-            Default::default(),
-        ));
+            StandardDescriptorSetAllocatorCreateInfo {
+                update_after_bind:true,
+                ..Default::default()
+        }));
 
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
@@ -1502,6 +1511,15 @@ impl App {
         }
 
         {
+let draw_data = rcx.imgui_context.render();
+
+// Upload BEFORE rendering
+rcx.imgui_renderer.upload(
+    &mut graphics_builder,
+    draw_data,
+    image_index as usize,
+);
+
             // IMGUI now?
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
@@ -1524,8 +1542,6 @@ impl App {
                     ..Default::default()
                 })
                 .unwrap();
-
-        let draw_data =     rcx.imgui_context.render();
 
             rcx.imgui_renderer
                 .draw(

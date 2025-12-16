@@ -11,10 +11,8 @@ layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec2 out_uv;
 
 struct Vertex {
-    float x;
-    float y;
-    float u;
-    float v;
+    float x,y;
+    float u,v;
     uint rgba;
 };
 
@@ -25,6 +23,7 @@ layout(buffer_reference, std430) readonly buffer VB {
 layout(push_constant) uniform PC {
     vec4 lrtb;
     VB vb;
+    uint texture_index;
 } pc;
 
 void main() {
@@ -32,16 +31,14 @@ void main() {
     out_color = unpackUnorm4x8(vert.rgba);
     out_uv = vec2(vert.u, vert.v);
 
-    float L = pc.lrtb.x;
-    float R = pc.lrtb.y;
-    float T = pc.lrtb.z;
-    float B = pc.lrtb.w;
+    float L=pc.lrtb.x, R=pc.lrtb.y;
+    float T=pc.lrtb.z, B=pc.lrtb.w;
 
     mat4 proj = mat4(
-        2.0 / (R - L), 0, 0, 0,
-        0, 2.0 / (T - B), 0, 0,
-        0, 0, -1, 0,
-        (R + L) / (L - R), (T + B) / (B - T), 0, 1
+        2/(R-L),0,0,0,
+        0,2/(T-B),0,0,
+        0,0,-1,0,
+        (R+L)/(L-R),(T+B)/(B-T),0,1
     );
 
     gl_Position = proj * vec4(vert.x, vert.y, 0, 1);
@@ -54,16 +51,34 @@ pub mod fs {
         ty: "fragment",
         src: r#"
 #version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 layout(location = 0) in vec4 in_color;
 layout(location = 1) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform sampler2D u_texture;
+layout(set = 0, binding = 0) uniform texture2D Textures[];
+layout(set = 0, binding = 1) uniform sampler ImmutableSampler;
 
-void main() {
-    vec4 tex = texture(u_texture, in_uv);
-    out_color = in_color * tex;
+layout(push_constant) uniform PC {
+    vec4 lrtb;
+    uint64_t vb;
+    uint texture_index;
+} pc;
+
+void main()
+{
+    vec4 tex =
+        texture(
+            sampler2D(
+                Textures[nonuniformEXT(pc.texture_index)],
+                ImmutableSampler
+            ),
+            in_uv
+        );
+
+    out_color = tex * in_color;
 }
 "# }
 }
