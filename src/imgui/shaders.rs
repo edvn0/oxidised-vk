@@ -20,10 +20,11 @@ layout(buffer_reference, std430) readonly buffer VB {
     Vertex v[];
 };
 
-layout(push_constant) uniform PC {
+layout(push_constant, std430) uniform PC {
     vec4 lrtb;
     VB vb;
     uint texture_index;
+    uint _pad;
 } pc;
 
 void main() {
@@ -35,10 +36,10 @@ void main() {
     float T=pc.lrtb.z, B=pc.lrtb.w;
 
     mat4 proj = mat4(
-        2/(R-L),0,0,0,
-        0,2/(T-B),0,0,
-        0,0,-1,0,
-        (R+L)/(L-R),(T+B)/(B-T),0,1
+        2/(R-L), 0, 0, 0,
+        0, 2/(B-T), 0, 0,
+        0, 0, -1, 0,
+        (R+L)/(L-R), (T+B)/(T-B), 0, 1
     );
 
     gl_Position = proj * vec4(vert.x, vert.y, 0, 1);

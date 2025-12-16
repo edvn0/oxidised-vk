@@ -33,6 +33,7 @@ use std::default::Default;
 use std::sync::RwLock;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
+use glm::all;
 use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
@@ -98,6 +99,7 @@ use vulkano::{
     },
     sync::{self, GpuFuture},
 };
+use vulkano::sync::fence::{Fence, FenceCreateFlags, FenceCreateInfo};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
 use winit::{
@@ -121,6 +123,9 @@ struct MeshDrawStream {
     mesh: Arc<MeshAsset>,
     indirect: Subbuffer<[DrawIndexedIndirectCommand]>,
     material_ids: Subbuffer<[u32]>,
+
+    transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
+    instance_count: u32, // ← NEW
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -249,10 +254,7 @@ struct MeshDraw {
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 struct FrameSubmission {
-    draws: Vec<DrawSubmission>,    // intent
-    transforms: Vec<TransformTRS>, // packed
-    material_ids: Vec<u32>,        // packed
-    mesh_draws: Vec<MeshDraw>,     // executable
+    draws: Vec<DrawSubmission>,
 }
 
 impl FrameSubmission {
@@ -262,14 +264,10 @@ impl FrameSubmission {
 
     pub fn clear_all(&mut self) {
         self.draws.clear();
-        self.transforms.clear();
-        self.material_ids.clear();
-        self.mesh_draws.clear();
     }
 }
 
 struct FrameResources {
-    transforms: Subbuffer<[TransformTRS]>,
     uniform_buffer: Subbuffer<RendererUBO>,
 }
 
@@ -307,6 +305,10 @@ struct RenderContext {
 }
 
 impl RenderContext {
+    pub fn frame_index(&self) -> usize {
+        self.current_frame
+    }
+
     pub fn update_camera_ubo(
         &self,
         camera: &Camera,
@@ -468,12 +470,7 @@ impl App {
         ));
 
         let mut scene = Scene::new();
-        scene.resources.insert(FrameSubmission {
-            draws: vec![],
-            transforms: vec![],
-            material_ids: vec![],
-            mesh_draws: vec![],
-        });
+        scene.resources.insert(FrameSubmission { draws: vec![] });
 
         Ok(App {
             instance,
@@ -524,22 +521,6 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
 }
 
 impl ApplicationHandler for App {
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let rcx = self.rcx.as_mut().unwrap();
-
-        let now = Instant::now();
-        let delta = now - self.last_frame;
-        self.last_frame = now;
-
-        rcx.imgui_context.io_mut().update_delta_time(delta);
-
-        rcx.winit_platform
-            .prepare_frame(rcx.imgui_context.io_mut(), rcx.window.as_ref())
-            .expect("imgui prepare_frame");
-
-        rcx.window.request_redraw();
-    }
-
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let mut attribs = Window::default_attributes();
         attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
@@ -677,12 +658,32 @@ impl ApplicationHandler for App {
                 update_material_ids_for_mesh(mesh, &mut w);
             }
 
+            let transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT] =
+                std::array::from_fn(|_| {
+                    Buffer::new_slice::<TransformTRS>(
+                        self.memory_allocator.clone(),
+                        BufferCreateInfo {
+                            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                            ..Default::default()
+                        },
+                        AllocationCreateInfo {
+                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                            ..Default::default()
+                        },
+                        1,
+                    )
+                        .unwrap()
+                });
+
             mesh_streams.insert(
                 mesh.clone(),
                 MeshDrawStream {
                     mesh: mesh.clone(),
                     indirect,
                     material_ids,
+                    transforms,
+                    instance_count: 0,
                 },
             );
         }
@@ -710,8 +711,6 @@ impl ApplicationHandler for App {
         let recreate_swapchain = false;
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
 
-        let image_count = swapchain.image_count();
-
         let uniform_buffers = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|_| {
                 Buffer::new_sized::<RendererUBO>(
@@ -729,27 +728,6 @@ impl ApplicationHandler for App {
                 .unwrap()
             })
             .collect::<Vec<Subbuffer<RendererUBO>>>();
-
-        let frame_transforms = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| {
-                let max_total_instances = INSTANCE_COUNT as usize;
-
-                Buffer::new_slice::<TransformTRS>(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                        ..Default::default()
-                    },
-                    max_total_instances as DeviceSize,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
 
         let _shadow_map_sampler = Sampler::new(
             self.device.clone(),
@@ -771,21 +749,29 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let mesh = mesh_registry
-            .read()
-            .unwrap()
-            .get("viking_room")
-            .unwrap()
-            .clone();
+        {
+            let registry = mesh_registry.read().unwrap();
 
-        for trs in generate_random_transforms(INSTANCE_COUNT) {
-            self.scene.world.push((
-                Transform { trs },
-                MeshComponent { mesh: mesh.clone() },
-                Visible,
-            ));
+            for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
+                self.scene.world.push((
+                    Transform { trs },
+                    MeshComponent {
+                        mesh: registry.get("viking_room").unwrap().clone(),
+                    },
+                    Visible,
+                ));
+            }
+
+            for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
+                self.scene.world.push((
+                    Transform { trs },
+                    MeshComponent {
+                        mesh: registry.get("suzanne").unwrap().clone(),
+                    },
+                    Visible,
+                ));
+            }
         }
-
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
 
@@ -794,7 +780,6 @@ impl ApplicationHandler for App {
             self.memory_allocator.clone(),
             self.descriptor_set_allocator.clone(),
             swapchain.image_format(),
-            swapchain.image_count() as usize,
         );
 
         renderer.upload_font_atlas(
@@ -808,7 +793,6 @@ impl ApplicationHandler for App {
 
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| FrameResources {
-                transforms: frame_transforms[i].clone(),
                 uniform_buffer: uniform_buffers[i].clone(),
             })
             .collect();
@@ -835,12 +819,7 @@ impl ApplicationHandler for App {
             composite,
             bloom_pass,
 
-            frame_submission: FrameSubmission {
-                transforms: vec![],
-                material_ids: vec![],
-                mesh_draws: vec![],
-                draws: vec![],
-            },
+            frame_submission: FrameSubmission { draws: vec![] },
             meshes: mesh_registry,
             mesh_streams,
 
@@ -946,6 +925,22 @@ impl ApplicationHandler for App {
             self.input_state.mouse_delta = (dx as f32, dy as f32);
         }
     }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let rcx = self.rcx.as_mut().unwrap();
+
+        let now = Instant::now();
+        let delta = now - self.last_frame;
+        self.last_frame = now;
+
+        rcx.imgui_context.io_mut().update_delta_time(delta);
+
+        rcx.winit_platform
+            .prepare_frame(rcx.imgui_context.io_mut(), rcx.window.as_ref())
+            .expect("imgui prepare_frame");
+
+        rcx.window.request_redraw();
+    }
 }
 
 fn create_image(
@@ -1015,6 +1010,7 @@ fn create_image(
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
+        let frame = rcx.current_frame;
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
             .size([300.0, 100.0], Condition::FirstUseEver)
@@ -1022,6 +1018,7 @@ impl App {
                 ui.text("Hello world!");
                 ui.text("こんにちは世界！");
                 ui.text("This...is...imgui-rs!");
+                ui.text(format!("FPS: {:?}", ui.io().framerate));
                 ui.separator();
                 let mouse_pos = ui.io().mouse_pos;
                 ui.text(format!(
@@ -1029,6 +1026,7 @@ impl App {
                     mouse_pos[0], mouse_pos[1]
                 ));
             });
+
         rcx.winit_platform.prepare_render(ui, &rcx.window); // step 5
 
         rcx.frame_submission.clear_all();
@@ -1038,7 +1036,7 @@ impl App {
         let mut submission = self.scene.resources.get_mut::<FrameSubmission>().unwrap();
 
         submission.drain_draws_into(&mut rcx.frame_submission.draws);
-        rcx.build_frame();
+        rcx.build_frame(self.memory_allocator.clone());
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -1100,15 +1098,7 @@ impl App {
             rcx.recreate_swapchain = true;
         }
 
-        acquire_future.wait(None).unwrap();
-
-        let required_instances = rcx.frame_submission.transforms.len();
-
-        rcx.ensure_frame_buffer_capacity(
-            rcx.current_frame,
-            required_instances,
-            &self.memory_allocator,
-        );
+       // acquire_future.wait(None).unwrap();
 
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
@@ -1120,24 +1110,6 @@ impl App {
         .unwrap();
 
         rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
-
-        {
-            let transforms = rcx.frames[rcx.current_frame].transforms.clone();
-
-            if let Ok(mut w) = transforms.write() {
-                w[..required_instances].copy_from_slice(&rcx.frame_submission.transforms);
-            }
-
-            for draw in &rcx.frame_submission.mesh_draws {
-                let stream = rcx.mesh_streams.get(&draw.mesh).unwrap();
-                if let Ok(mut cmds) = stream.indirect.write() {
-                    for cmd in cmds.iter_mut() {
-                        cmd.first_instance = draw.first_instance;
-                        cmd.instance_count = draw.instance_count;
-                    }
-                }
-            }
-        }
 
         {
             graphics_builder
@@ -1195,10 +1167,7 @@ impl App {
                 let set_1 = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     layout.clone(),
-                    [WriteDescriptorSet::buffer(
-                        1,
-                        rcx.frames[rcx.current_frame].transforms.clone(),
-                    )],
+                    [WriteDescriptorSet::buffer(1, stream.transforms[rcx.frame_index()].clone())],
                     [],
                 )
                 .unwrap();
@@ -1334,10 +1303,7 @@ impl App {
                                 )))
                                 .take(256),
                         ),
-                        WriteDescriptorSet::buffer(
-                            1,
-                            rcx.frames[rcx.current_frame].transforms.clone(),
-                        ),
+                        WriteDescriptorSet::buffer(1, stream.transforms[rcx.frame_index()].clone()),
                         WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
                         WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
                     ],
@@ -1529,16 +1495,30 @@ impl App {
 
         {
             let draw_data = rcx.imgui_context.render();
-
-            // Upload BEFORE rendering
-            rcx.imgui_renderer
-                .upload(&mut graphics_builder, draw_data, rcx.current_frame);
-
-            // IMGUI now?
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "ImGui Render".to_string(),
-                    color: [0.5, 0.5, 0.5, 1.0],
+                    label_name: "ImGui".to_string(),
+                    color: [0.5, 0.5, 0.9, 1.0],
+                    ..Default::default()
+                })
+                .unwrap();
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Upload".to_string(),
+                    color: [0.5, 0.5, 0.9, 1.0],
+                    ..Default::default()
+                })
+                .unwrap();
+            rcx.imgui_renderer
+                .upload(&mut graphics_builder, draw_data, rcx.current_frame);
+            unsafe {
+                graphics_builder.end_debug_utils_label().unwrap();
+            }
+
+            graphics_builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: "Render".to_string(),
+                    color: [0.9, 0.5, 0.5, 1.0],
                     ..Default::default()
                 })
                 .unwrap()
@@ -1557,17 +1537,18 @@ impl App {
                 })
                 .unwrap();
 
-            graphics_builder
-                .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
-                .unwrap()
-                .set_scissor(0, [rcx.scissor].into_iter().collect())
-                .unwrap();
-            rcx.imgui_renderer
-                .draw(&mut graphics_builder, draw_data, rcx.current_frame);
+            rcx.imgui_renderer.draw(
+                &mut graphics_builder,
+                draw_data,
+                rcx.current_frame,
+                (&rcx.viewport, &rcx.scissor),
+            );
 
             unsafe {
                 graphics_builder
                     .end_rendering()
+                    .unwrap()
+                    .end_debug_utils_label()
                     .unwrap()
                     .end_debug_utils_label()
                     .unwrap();
@@ -1575,6 +1556,8 @@ impl App {
         }
 
         let cmd_buf = graphics_builder.build().unwrap();
+
+        acquire_future.wait(None).unwrap();
 
         let future = rcx
             .previous_frame_end
@@ -1588,6 +1571,8 @@ impl App {
                 SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
             )
             .then_signal_fence_and_flush();
+
+
 
         match future.map_err(Validated::unwrap) {
             Ok(f) => rcx.previous_frame_end = Some(f.boxed()),
@@ -1608,64 +1593,55 @@ impl App {
 }
 
 impl RenderContext {
-    fn build_frame(&mut self) {
-        let submission = &mut self.frame_submission;
-
-        submission.mesh_draws.clear();
-        submission.transforms.clear();
-        submission.material_ids.clear();
+    fn build_frame(&mut self, allocator: Arc<StandardMemoryAllocator>) {
+        let submission = &self.frame_submission;
 
         let mut buckets: HashMap<Arc<MeshAsset>, Vec<&DrawSubmission>> = HashMap::new();
-
         for draw in &submission.draws {
             buckets.entry(draw.mesh.clone()).or_default().push(draw);
         }
 
-        let mut base_instance = 0u32;
-
         for (mesh, draws) in buckets {
-            let first_instance = base_instance;
+            let stream = self.mesh_streams.get_mut(&mesh).unwrap();
 
-            for d in &draws {
-                submission.transforms.push(d.transform);
+            let required = draws.len();
+
+            if stream.transforms.len() < required {
+                let new_capacity = required.next_power_of_two().max(1);
+
+                stream.transforms =
+                    std::array::from_fn(|_| {
+                        Buffer::new_slice::<TransformTRS>(
+                            allocator.clone(),
+                            BufferCreateInfo {
+                                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo {
+                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                                ..Default::default()
+                            },
+                            new_capacity as DeviceSize,
+                        )
+                            .unwrap()
+                    });
             }
 
-            let instance_count = draws.len() as u32;
+            if let Ok(mut w) = stream.transforms[self.current_frame].write() {
+                for (i, d) in draws.iter().enumerate() {
+                    w[i] = d.transform;
+                }
+            }
 
-            submission.mesh_draws.push(MeshDraw {
-                mesh: mesh.clone(),
-                first_instance,
-                instance_count,
-            });
+            stream.instance_count = required as u32;
 
-            base_instance += instance_count;
-        }
-    }
-
-    fn ensure_frame_buffer_capacity(
-        &mut self,
-        current_frame: usize,
-        required_instances: usize,
-        allocator: &Arc<StandardMemoryAllocator>,
-    ) {
-        let current = self.frames[current_frame].transforms.len() as usize;
-        if current < required_instances {
-            let new_capacity = required_instances.next_power_of_two();
-
-            self.frames[current_frame].transforms = Buffer::new_slice::<TransformTRS>(
-                allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                    ..Default::default()
-                },
-                new_capacity as DeviceSize,
-            )
-            .unwrap();
+            if let Ok(mut cmds) = stream.indirect.write() {
+                for cmd in cmds.iter_mut() {
+                    cmd.first_instance = 0;
+                    cmd.instance_count = stream.instance_count;
+                }
+            }
         }
     }
 }

@@ -1,5 +1,4 @@
 use std::{collections::BTreeMap, sync::Arc};
-
 use imgui::{DrawCmd, DrawData};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -39,8 +38,12 @@ use vulkano::{
     shader::ShaderStages,
     sync::GpuFuture,
 };
-
-use crate::{imgui::shaders, mesh::ImageViewSampler};
+use vulkano::command_buffer::RecordingCommandBuffer;
+use vulkano::pipeline::DynamicState;
+use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
+use crate::{imgui::shaders, mesh::ImageViewSampler, MAX_FRAMES_IN_FLIGHT};
 
 #[repr(C)]
 #[derive(BufferContents, Copy, Clone)]
@@ -73,7 +76,7 @@ pub struct ImGuiRenderer {
 
     sampler_clamp: Arc<Sampler>,
 
-    frames: Vec<FrameBuffers>,
+    frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT],
 }
 
 impl ImGuiRenderer {
@@ -82,7 +85,6 @@ impl ImGuiRenderer {
         allocator: Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         image_format: Format,
-        frame_count: usize,
     ) -> Self {
         let sampler_clamp = Sampler::new(
             device.clone(),
@@ -106,9 +108,7 @@ impl ImGuiRenderer {
             sampler_clamp.clone(),
         );
 
-        let frames = (0..frame_count)
-            .map(|_| Self::empty_frame(allocator.clone()))
-            .collect();
+        let frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|x| Self::empty_frame(allocator.clone()));
 
         Self {
             allocator,
@@ -162,6 +162,7 @@ impl ImGuiRenderer {
         cmd: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         draw_data: &DrawData,
         frame_index: usize,
+        vp: (&Viewport, &Scissor),
     ) {
         let fb = &self.frames[frame_index];
 
@@ -196,14 +197,19 @@ impl ImGuiRenderer {
                     lrtb: [l, r, t, b],
                     vb: vb_addr.get(),
                     texture_index: cmd_params.texture_id.id() as u32,
+                    _pad: 0,
                 };
+
+                let (viewport, scissor) = vp;
 
                 cmd.push_constants(self.pipeline.layout().clone(), 0, pc)
                     .unwrap()
                     .set_depth_test_enable(false)
                     .unwrap()
                     .set_depth_write_enable(false)
-                    .unwrap();
+                    .unwrap()
+                    .set_scissor(0, [scissor.clone()].into_iter().collect()).unwrap()
+                .set_viewport(0, [viewport.clone()].into_iter().collect()).unwrap();
                 unsafe {
                     cmd.draw_indexed(
                         count as u32,
@@ -401,9 +407,13 @@ impl ImGuiRenderer {
                 ..ColorBlendAttachmentState::default()
             },
         ));
+        ci.dynamic_state.insert(DepthTestEnable);
+        ci.dynamic_state.insert(DynamicState::Scissor);
+        ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DepthWriteEnable);
 
         ci.subpass = Some(
-            vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo {
+            PipelineRenderingCreateInfo {
                 color_attachment_formats: vec![Some(format)],
                 ..Default::default()
             }
@@ -489,8 +499,10 @@ fn upload_buffers(
     fb: &FrameBuffers,
     draw_data: &DrawData,
 ) {
-    let mut vtx = fb.vb_staging.write().unwrap();
-    let mut idx = fb.ib_staging.write().unwrap();
+    let (mut vtx, mut idx) = match (fb.vb_staging.write(), fb.ib_staging.write()) {
+        (Ok(v), Ok(i)) => (v, i),
+        _ => return,
+    };
 
     let mut vo = 0;
     let mut io = 0;
@@ -505,7 +517,8 @@ fn upload_buffers(
             d.col = s.col;
         }
 
-        idx[io..io + list.idx_buffer().len()].copy_from_slice(list.idx_buffer());
+        idx[io..io + list.idx_buffer().len()]
+            .copy_from_slice(list.idx_buffer());
 
         vo += list.vtx_buffer().len();
         io += list.idx_buffer().len();
@@ -515,13 +528,15 @@ fn upload_buffers(
         fb.vb_staging.clone(),
         fb.vb_gpu.clone(),
     ))
-    .unwrap();
+        .unwrap();
+
     cmd.copy_buffer(CopyBufferInfo::buffers(
         fb.ib_staging.clone(),
         fb.ib_gpu.clone(),
     ))
-    .unwrap();
+        .unwrap();
 }
+
 
 fn ensure_capacity(
     allocator: &Arc<StandardMemoryAllocator>,
