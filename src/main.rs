@@ -28,8 +28,6 @@ use ::imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
-use vulkano::descriptor_set::pool::DescriptorPoolCreateFlags;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::RwLock;
@@ -38,7 +36,9 @@ use std::{error::Error, sync::Arc};
 use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
+use vulkano::descriptor_set::pool::DescriptorPoolCreateFlags;
 use vulkano::device::DeviceOwned;
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
@@ -246,6 +246,8 @@ struct MeshDraw {
     instance_count: u32,
 }
 
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
 struct FrameSubmission {
     draws: Vec<DrawSubmission>,    // intent
     transforms: Vec<TransformTRS>, // packed
@@ -266,6 +268,11 @@ impl FrameSubmission {
     }
 }
 
+struct FrameResources {
+    transforms: Subbuffer<[TransformTRS]>,
+    uniform_buffer: Subbuffer<RendererUBO>,
+}
+
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
@@ -279,14 +286,14 @@ struct RenderContext {
     meshes: Arc<RwLock<MeshRegistry>>,
     mesh_streams: HashMap<Arc<MeshAsset>, MeshDrawStream>,
 
-    frame_transforms: Vec<Subbuffer<[TransformTRS]>>, // TODO: Move
     white_image_sampler: Arc<ImageViewSampler>,
     black_image_sampler: Arc<ImageViewSampler>,
 
     context_descriptor_set: FrameDescriptorSet,
-    frame_uniform_buffers: Vec<Subbuffer<RendererUBO>>,
 
     frame_submission: FrameSubmission,
+    current_frame: usize,
+    frames: Vec<FrameResources>,
 
     mrt_pass: MRT,
     mrt_lighting: MRTLighting,
@@ -303,7 +310,7 @@ impl RenderContext {
     pub fn update_camera_ubo(
         &self,
         camera: &Camera,
-        image_index: usize,
+        current_frame: usize,
         window_size: PhysicalSize<u32>,
     ) {
         let aspect = window_size.width as f32 / window_size.height as f32;
@@ -314,7 +321,7 @@ impl RenderContext {
 
         let sun = camera.sun_direction_view_space();
 
-        if let Ok(mut w) = self.frame_uniform_buffers[image_index].write() {
+        if let Ok(mut w) = self.frames[current_frame].uniform_buffer.write() {
             *w = RendererUBO {
                 view: view.as_slice().try_into().unwrap(),
                 proj: proj.as_slice().try_into().unwrap(),
@@ -450,9 +457,10 @@ impl App {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
             StandardDescriptorSetAllocatorCreateInfo {
-                update_after_bind:true,
+                update_after_bind: true,
                 ..Default::default()
-        }));
+            },
+        ));
 
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
@@ -562,7 +570,9 @@ impl ApplicationHandler for App {
                 self.device.clone(),
                 surface,
                 SwapchainCreateInfo {
-                    min_image_count: surface_capabilities.min_image_count.max(2),
+                    min_image_count: surface_capabilities
+                        .min_image_count
+                        .max(MAX_FRAMES_IN_FLIGHT as u32),
 
                     image_format,
                     image_extent: window_size.into(),
@@ -702,7 +712,7 @@ impl ApplicationHandler for App {
 
         let image_count = swapchain.image_count();
 
-        let uniform_buffers = (0..image_count)
+        let uniform_buffers = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|_| {
                 Buffer::new_sized::<RendererUBO>(
                     self.memory_allocator.clone(),
@@ -720,7 +730,7 @@ impl ApplicationHandler for App {
             })
             .collect::<Vec<Subbuffer<RendererUBO>>>();
 
-        let frame_transforms = (0..image_count)
+        let frame_transforms = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|_| {
                 let max_total_instances = INSTANCE_COUNT as usize;
 
@@ -796,6 +806,13 @@ impl ApplicationHandler for App {
         let mut platform = WinitPlatform::new(&mut imgui); // step 1
         platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
 
+        let frames = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|i| FrameResources {
+                transforms: frame_transforms[i].clone(),
+                uniform_buffer: uniform_buffers[i].clone(),
+            })
+            .collect();
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -809,12 +826,10 @@ impl ApplicationHandler for App {
             context_descriptor_set: FrameDescriptorSet::new(
                 self.device.clone(),
                 self.descriptor_set_allocator.clone(),
-                &uniform_buffers,
+                &uniform_buffers[..MAX_FRAMES_IN_FLIGHT],
             ),
-            frame_transforms,
             white_image_sampler: white_tex,
             black_image_sampler: black_tex,
-            frame_uniform_buffers: uniform_buffers,
             mrt_pass: mrt,
             mrt_lighting,
             composite,
@@ -832,6 +847,8 @@ impl ApplicationHandler for App {
             winit_platform: platform,
             imgui_context: imgui,
             imgui_renderer: renderer,
+            current_frame: 0,
+            frames,
         });
     }
 
@@ -1088,7 +1105,7 @@ impl App {
         let required_instances = rcx.frame_submission.transforms.len();
 
         rcx.ensure_frame_buffer_capacity(
-            image_index as usize,
+            rcx.current_frame,
             required_instances,
             &self.memory_allocator,
         );
@@ -1102,10 +1119,10 @@ impl App {
         )
         .unwrap();
 
-        rcx.update_camera_ubo(&self.camera, image_index as usize, window_size);
+        rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
 
         {
-            let transforms = rcx.frame_transforms[image_index as usize].clone();
+            let transforms = rcx.frames[rcx.current_frame].transforms.clone();
 
             if let Ok(mut w) = transforms.write() {
                 w[..required_instances].copy_from_slice(&rcx.frame_submission.transforms);
@@ -1166,7 +1183,7 @@ impl App {
                     rcx.mrt_pass.predepth_pipeline.layout().clone(),
                     0,
                     [rcx.context_descriptor_set
-                        .for_frame(image_index as usize)
+                        .for_frame(rcx.current_frame)
                         .clone()]
                     .to_vec(),
                 )
@@ -1180,7 +1197,7 @@ impl App {
                     layout.clone(),
                     [WriteDescriptorSet::buffer(
                         1,
-                        rcx.frame_transforms[image_index as usize].clone(),
+                        rcx.frames[rcx.current_frame].transforms.clone(),
                     )],
                     [],
                 )
@@ -1284,7 +1301,7 @@ impl App {
                     rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
                     0,
                     [rcx.context_descriptor_set
-                        .for_frame(image_index as usize)
+                        .for_frame(rcx.current_frame)
                         .clone()]
                     .to_vec(),
                 )
@@ -1319,7 +1336,7 @@ impl App {
                         ),
                         WriteDescriptorSet::buffer(
                             1,
-                            rcx.frame_transforms[image_index as usize].clone(),
+                            rcx.frames[rcx.current_frame].transforms.clone(),
                         ),
                         WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
                         WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
@@ -1361,7 +1378,7 @@ impl App {
             // Pass 2: MRT Lighting
             let descriptor_sets = vec![
                 rcx.context_descriptor_set
-                    .for_frame(image_index as usize)
+                    .for_frame(rcx.current_frame)
                     .clone(),
                 rcx.mrt_lighting.set.clone(),
             ];
@@ -1511,14 +1528,11 @@ impl App {
         }
 
         {
-let draw_data = rcx.imgui_context.render();
+            let draw_data = rcx.imgui_context.render();
 
-// Upload BEFORE rendering
-rcx.imgui_renderer.upload(
-    &mut graphics_builder,
-    draw_data,
-    image_index as usize,
-);
+            // Upload BEFORE rendering
+            rcx.imgui_renderer
+                .upload(&mut graphics_builder, draw_data, rcx.current_frame);
 
             // IMGUI now?
             graphics_builder
@@ -1543,12 +1557,13 @@ rcx.imgui_renderer.upload(
                 })
                 .unwrap();
 
+            graphics_builder
+                .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
+                .unwrap()
+                .set_scissor(0, [rcx.scissor].into_iter().collect())
+                .unwrap();
             rcx.imgui_renderer
-                .draw(
-                    &mut graphics_builder,
-                    draw_data,
-                    image_index as usize,
-                );
+                .draw(&mut graphics_builder, draw_data, rcx.current_frame);
 
             unsafe {
                 graphics_builder
@@ -1587,6 +1602,8 @@ rcx.imgui_renderer.upload(
         }
 
         self.input_state.end_frame();
+
+        rcx.current_frame = (rcx.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 }
 
@@ -1627,16 +1644,15 @@ impl RenderContext {
 
     fn ensure_frame_buffer_capacity(
         &mut self,
-        image_index: usize,
+        current_frame: usize,
         required_instances: usize,
         allocator: &Arc<StandardMemoryAllocator>,
     ) {
-        let current = self.frame_transforms[image_index].len() as usize;
-
+        let current = self.frames[current_frame].transforms.len() as usize;
         if current < required_instances {
             let new_capacity = required_instances.next_power_of_two();
 
-            self.frame_transforms[image_index] = Buffer::new_slice::<TransformTRS>(
+            self.frames[current_frame].transforms = Buffer::new_slice::<TransformTRS>(
                 allocator.clone(),
                 BufferCreateInfo {
                     usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,

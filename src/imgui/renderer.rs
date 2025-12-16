@@ -199,8 +199,11 @@ impl ImGuiRenderer {
                 };
 
                 cmd.push_constants(self.pipeline.layout().clone(), 0, pc)
+                    .unwrap()
+                    .set_depth_test_enable(false)
+                    .unwrap()
+                    .set_depth_write_enable(false)
                     .unwrap();
-
                 unsafe {
                     cmd.draw_indexed(
                         count as u32,
