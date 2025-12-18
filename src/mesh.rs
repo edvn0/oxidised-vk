@@ -545,7 +545,7 @@ pub fn load_meshes_from_directory(
         .collect();
 
 
-    let registry = Arc::new(RwLock::new(MeshRegistry::new(Default::default())));
+    let registry = Arc::new(RwLock::new(MeshRegistry::new()));
     if let Ok(mut write_guard) =registry.write() {
     entries.sort_by_key(|e| e.path());
         for entry in entries {

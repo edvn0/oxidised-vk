@@ -42,7 +42,7 @@ use vulkano::pipeline::DynamicState;
 use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
-use crate::{imgui::shaders, mesh::ImageViewSampler, MAX_FRAMES_IN_FLIGHT};
+use crate::{MAX_FRAMES_IN_FLIGHT, image::{ImageInfo, create_image}, imgui::shaders, mesh::ImageViewSampler};
 
 #[repr(C)]
 #[derive(BufferContents, Copy, Clone)]
@@ -130,14 +130,14 @@ impl ImGuiRenderer {
         let fonts = imgui.fonts();
         let atlas = fonts.build_rgba32_texture();
 
-        let tex = create_image_from_rgba_bytes(
-            queue,
-            cb_allocator,
+        let image_info = ImageInfo::new([atlas.width as u32, atlas.height as u32], Format::R8G8B8A8_UNORM, String::from("Font Atlas"), self.sampler_clamp.clone());
+
+        let tex = create_image(
+            queue.clone(),
+            cb_allocator.clone(),
             self.allocator.clone(),
-            atlas.width as u32,
-            atlas.height as u32,
-            atlas.data,
-            self.sampler_clamp.clone(),
+            &atlas.data,
+            image_info,
         );
 
         let tex_id = self.register_texture(tex);
@@ -426,71 +426,6 @@ impl ImGuiRenderer {
 
         (pipeline, texture_set)
     }
-}
-
-fn create_image_from_rgba_bytes(
-    queue: Arc<Queue>,
-    cb_allocator: Arc<StandardCommandBufferAllocator>,
-    allocator: Arc<StandardMemoryAllocator>,
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-    sampler: Arc<Sampler>,
-) -> Arc<ImageViewSampler> {
-    let image = Image::new(
-        allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::R8G8B8A8_UNORM,
-            extent: [width, height, 1],
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        Default::default(),
-    )
-    .unwrap();
-
-    let staging = Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        rgba.iter().copied(),
-    )
-    .unwrap();
-
-    {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            cb_allocator,
-            queue.queue_family_index(),
-            vulkano::command_buffer::CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        builder
-            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
-            .unwrap();
-
-        builder
-            .build()
-            .unwrap()
-            .execute(queue)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
-    }
-
-    Arc::new(ImageViewSampler::new(
-        ImageView::new_default(image).unwrap(),
-        sampler,
-    ))
 }
 
 fn upload_buffers(
