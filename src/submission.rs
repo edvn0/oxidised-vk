@@ -1,5 +1,5 @@
-use crate::mesh_registry::MeshHandle;
 use crate::TransformTRS;
+use crate::mesh_registry::MeshHandle;
 
 pub struct DrawSubmission {
     pub mesh: MeshHandle,

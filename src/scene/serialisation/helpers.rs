@@ -1,5 +1,5 @@
-use std::io::{Read, Write, Result as IoResult};
 use bytemuck::{Pod, Zeroable};
+use std::io::{Read, Result as IoResult, Write};
 
 pub fn serialize_pod<T: Pod>(value: &T, writer: &mut dyn Write) -> IoResult<()> {
     writer.write_all(bytemuck::bytes_of(value))
@@ -39,16 +39,14 @@ pub fn deserialize_string(reader: &mut dyn Read) -> IoResult<String> {
 
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes)?;
-    String::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use bytemuck::{Pod, Zeroable};
+    use std::io::Cursor;
 
     #[repr(C)]
     #[derive(Copy, Clone, Debug, PartialEq)]

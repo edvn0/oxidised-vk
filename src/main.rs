@@ -2,17 +2,17 @@ extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
 mod components;
+mod engine_shaders;
 mod image;
 mod imgui;
 mod input_state;
-mod submission;
 mod main_helpers;
 mod math;
 mod mesh;
-mod engine_shaders;
 mod mesh_registry;
 mod scene;
 mod shader_bindings;
+mod submission;
 mod texture_cache;
 mod vertex;
 
@@ -27,6 +27,7 @@ use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
 use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
+use crate::submission::{DrawSubmission, FrameSubmission};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use ::imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
@@ -108,7 +109,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use crate::submission::{DrawSubmission, FrameSubmission};
 
 const INSTANCE_COUNT: DeviceSize = 200;
 
@@ -491,7 +491,7 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let  mut attribs = Window::default_attributes();
+        let mut attribs = Window::default_attributes();
         attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
         let window = Arc::new(event_loop.create_window(attribs).unwrap());
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
@@ -914,8 +914,6 @@ impl ApplicationHandler for App {
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
-        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
-
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
             .size([300.0, 100.0], Condition::FirstUseEver)
@@ -938,7 +936,11 @@ impl App {
 
         self.scene.update();
 
-        let mut submission = self.scene.resources_mut().get_mut::<FrameSubmission>().unwrap();
+        let mut submission = self
+            .scene
+            .resources_mut()
+            .get_mut::<FrameSubmission>()
+            .unwrap();
 
         submission.drain_draws_into(&mut rcx.frame_submission.draws);
         rcx.build_frame(self.memory_allocator.clone());
@@ -952,8 +954,6 @@ impl App {
         let window_size = rcx.window.inner_size();
         rcx.elapsed_millis = rcx.start_time.elapsed().as_millis() as u64;
 
-        // Do not draw the frame when the screen size is zero. On Windows, this can occur
-        // when minimizing the application.
         if window_size.width == 0 || window_size.height == 0 {
             return;
         }
@@ -1002,9 +1002,6 @@ impl App {
         if suboptimal {
             rcx.recreate_swapchain = true;
         }
-
-        // acquire_future.wait(None).unwrap();
-
 
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
@@ -1464,8 +1461,7 @@ impl App {
 
         let cmd_buf = graphics_builder.build().unwrap();
 
-        acquire_future.wait(None).unwrap();
-
+        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
         let future = rcx
             .previous_frame_end
             .take()
@@ -1549,7 +1545,6 @@ impl RenderContext {
         }
     }
 }
-
 
 fn window_size_dependent_setup(
     device: &Arc<Device>,

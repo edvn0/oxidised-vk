@@ -1,6 +1,19 @@
 use std::sync::Arc;
 
-use vulkano::{buffer::{Buffer, BufferCreateInfo, BufferUsage}, command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, PrimaryCommandBufferAbstract, allocator::StandardCommandBufferAllocator}, device::{DeviceOwned, Queue}, format::Format, image::{Image, ImageCreateInfo, ImageUsage, max_mip_levels, sampler::Sampler, view::ImageView}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, sync::{self, GpuFuture}};
+use vulkano::{
+    buffer::{Buffer, BufferCreateInfo, BufferUsage},
+    command_buffer::{
+        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
+        PrimaryCommandBufferAbstract, allocator::StandardCommandBufferAllocator,
+    },
+    device::{DeviceOwned, Queue},
+    format::Format,
+    image::{
+        Image, ImageCreateInfo, ImageUsage, max_mip_levels, sampler::Sampler, view::ImageView,
+    },
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    sync::{self, GpuFuture},
+};
 
 use crate::mesh::ImageViewSampler;
 
@@ -82,7 +95,12 @@ pub fn create_image(
 
     {
         // Perform a clear to the specified value
-        let mut builder = AutoCommandBufferBuilder::primary(cb_allocator.clone(), queue.queue_family_index(), CommandBufferUsage::OneTimeSubmit).unwrap();
+        let mut builder = AutoCommandBufferBuilder::primary(
+            cb_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
 
         let staging = Buffer::from_iter(
             allocator.clone(),
@@ -99,16 +117,15 @@ pub fn create_image(
         )
         .unwrap();
 
-        let ended =  {
-
+        let ended = {
             builder
-            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, img.clone()))
-            .unwrap();
-        
-        builder.build().unwrap()
-    };
+                .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, img.clone()))
+                .unwrap();
 
-    let result = ended.execute(queue.clone()).unwrap();
+            builder.build().unwrap()
+        };
+
+        let result = ended.execute(queue.clone()).unwrap();
 
         result
             .then_signal_fence_and_flush()

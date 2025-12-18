@@ -1,9 +1,9 @@
 pub mod vs {
     vulkano_shaders::shader! {
-        ty: "vertex",
-        vulkan_version: "1.3",
-        spirv_version: "1.6",
-        src: r#"
+            ty: "vertex",
+            vulkan_version: "1.3",
+            spirv_version: "1.6",
+            src: r#"
 #version 460
 #extension GL_EXT_buffer_reference : require
 
@@ -49,8 +49,8 @@ void main() {
 
 pub mod fs {
     vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r#"
+            ty: "fragment",
+            src: r#"
 #version 460
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require

@@ -1,4 +1,3 @@
-
 pub(crate) mod predepth {
     pub mod vs {
         vulkano_shaders::shader! {

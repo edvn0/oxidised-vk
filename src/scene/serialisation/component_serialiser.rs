@@ -1,26 +1,27 @@
-use std::io::{Read, Write, Result as IoResult};
 use std::any::TypeId;
+use std::io::{Read, Result as IoResult, Write};
 
 use legion::world::EntryRef;
 
-/// Trait for components that can be serialized to/from binary format
 pub trait SerializableComponent: Send + Sync + 'static {
     fn serialize(&self, writer: &mut dyn Write) -> IoResult<()>;
-    fn deserialize(reader: &mut dyn Read) -> IoResult<Self> where Self: Sized;
-    fn type_id() -> TypeId where Self: Sized {
+    fn deserialize(reader: &mut dyn Read) -> IoResult<Self>
+    where
+        Self: Sized;
+    fn type_id() -> TypeId
+    where
+        Self: Sized,
+    {
         TypeId::of::<Self>()
     }
-    fn type_name() -> &'static str where Self: Sized;
+    fn type_name() -> &'static str
+    where
+        Self: Sized;
 }
 
-/// Trait for type-erased component serialisation
 pub trait ComponentSerialiser: Send + Sync {
-    fn serialize_component(
-        &self,
-        entry: &EntryRef<'_>,
-        writer: &mut dyn Write,
-    ) -> IoResult<()>;
-    
+    fn serialize_component(&self, entry: &EntryRef<'_>, writer: &mut dyn Write) -> IoResult<()>;
+
     fn deserialize_component(
         &self,
         reader: &mut dyn Read,
@@ -28,7 +29,6 @@ pub trait ComponentSerialiser: Send + Sync {
     ) -> IoResult<()>;
 }
 
-/// Typed implementation of ComponentSerialiser
 pub(crate) struct TypedComponentSerialiser<T: SerializableComponent> {
     _phantom: std::marker::PhantomData<T>,
 }
@@ -41,14 +41,10 @@ impl<T: SerializableComponent> TypedComponentSerialiser<T> {
     }
 }
 
-impl<T: SerializableComponent + legion::storage::Component> ComponentSerialiser 
-    for TypedComponentSerialiser<T> 
+impl<T: SerializableComponent + legion::storage::Component> ComponentSerialiser
+    for TypedComponentSerialiser<T>
 {
-    fn serialize_component(
-        &self,
-        entry: &EntryRef<'_>,
-        writer: &mut dyn Write,
-    ) -> IoResult<()> {
+    fn serialize_component(&self, entry: &EntryRef<'_>, writer: &mut dyn Write) -> IoResult<()> {
         if let Ok(component) = entry.get_component::<T>() {
             component.serialize(writer)
         } else {
@@ -58,7 +54,7 @@ impl<T: SerializableComponent + legion::storage::Component> ComponentSerialiser
             ))
         }
     }
-    
+
     fn deserialize_component(
         &self,
         reader: &mut dyn Read,
@@ -71,7 +67,12 @@ impl<T: SerializableComponent + legion::storage::Component> ComponentSerialiser
 }
 
 mod serialiser_implementations {
-    use crate::{TransformTRS, components::{self, MeshComponent, Transform}, mesh_registry::MeshHandle, scene::serialisation::{SerializableComponent, deserialize_pod, serialize_pod}};
+    use crate::{
+        TransformTRS,
+        components::{self, MeshComponent, Transform},
+        mesh_registry::MeshHandle,
+        scene::serialisation::{SerializableComponent, deserialize_pod, serialize_pod},
+    };
     use std::io::{Read, Write};
 
     type TransformSlice = [f32; 16];
@@ -79,9 +80,8 @@ mod serialiser_implementations {
 
     impl SerializableComponent for Transform {
         fn serialize(&self, writer: &mut dyn Write) -> std::io::Result<()> {
-            let bytes: &[u8] = bytemuck::try_cast_slice::<f32, u8>(&self.transform.trs).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?;
+            let bytes: &[u8] = bytemuck::try_cast_slice::<f32, u8>(&self.transform.trs)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             writer.write_all(bytes)
         }
 
@@ -89,9 +89,8 @@ mod serialiser_implementations {
             let mut bytes = [0u8; BYTES_PER_TRANSFORM];
             reader.read_exact(&mut bytes)?;
 
-            let trs: TransformSlice = *bytemuck::try_from_bytes::<TransformSlice>(&bytes).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?;
+            let trs: TransformSlice = *bytemuck::try_from_bytes::<TransformSlice>(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
             Ok(Self {
                 transform: TransformTRS { trs },
@@ -109,7 +108,7 @@ mod serialiser_implementations {
         }
 
         fn deserialize(reader: &mut dyn Read) -> std::io::Result<Self> {
-            let mesh_id= deserialize_pod::<u32>(reader)?;
+            let mesh_id = deserialize_pod::<u32>(reader)?;
             Ok(Self {
                 mesh: MeshHandle(mesh_id),
             })
