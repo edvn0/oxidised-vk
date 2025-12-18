@@ -2,6 +2,8 @@ extern crate nalgebra_glm as glm;
 mod bloom_pass;
 mod camera;
 mod components;
+mod engine_shaders;
+mod image;
 mod imgui;
 mod input_state;
 mod main_helpers;
@@ -10,19 +12,22 @@ mod mesh;
 mod mesh_registry;
 mod scene;
 mod shader_bindings;
+mod submission;
 mod texture_cache;
 mod vertex;
 
 use crate::bloom_pass::BloomPass;
 use crate::camera::Camera;
 use crate::components::{MeshComponent, Transform, Visible};
+use crate::image::{ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
-use crate::mesh_registry::MeshRegistry;
-use crate::scene::Scene;
+use crate::mesh_registry::{MeshHandle, MeshRegistry};
+use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
+use crate::submission::{DrawSubmission, FrameSubmission};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use ::imgui::{Condition, Context};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
@@ -30,22 +35,20 @@ use nalgebra::{Matrix4, Translation3};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
+use std::path::Path;
 use std::sync::RwLock;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use vulkano::command_buffer::{
-    ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
-};
+use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
-use vulkano::device::DeviceOwned;
-use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
+use vulkano::format::{ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
     SamplerMipmapMode,
 };
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{ImageAspects, ImageSubresourceRange, SampleCount};
+use vulkano::image::{ImageAspects, ImageSubresourceRange};
 use vulkano::instance::InstanceExtensions;
 use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
@@ -234,28 +237,7 @@ pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
 
-#[derive(Clone)]
-struct DrawSubmission {
-    mesh: Arc<MeshAsset>,
-    transform: TransformTRS,
-    override_material: Option<u32>,
-}
-
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
-
-struct FrameSubmission {
-    draws: Vec<DrawSubmission>,
-}
-
-impl FrameSubmission {
-    pub fn drain_draws_into(&mut self, dst: &mut Vec<DrawSubmission>) {
-        dst.extend(self.draws.drain(..));
-    }
-
-    pub fn clear_all(&mut self) {
-        self.draws.clear();
-    }
-}
 
 struct FrameResources {
     uniform_buffer: Subbuffer<RendererUBO>,
@@ -272,7 +254,7 @@ struct RenderContext {
     elapsed_millis: u64,
 
     meshes: Arc<RwLock<MeshRegistry>>,
-    mesh_streams: HashMap<Arc<MeshAsset>, MeshDrawStream>,
+    mesh_streams: HashMap<MeshHandle, MeshDrawStream>,
 
     white_image_sampler: Arc<ImageViewSampler>,
 
@@ -458,9 +440,6 @@ impl App {
             Default::default(),
         ));
 
-        let mut scene = Scene::new();
-        scene.resources.insert(FrameSubmission { draws: vec![] });
-
         Ok(App {
             instance,
             device,
@@ -476,7 +455,7 @@ impl App {
             cull_backfaces: Culling::Back,
             clockwise_front_face: Winding::CounterClockwise,
             lod_choice: 0,
-            scene,
+            scene: Scene::new(),
         })
     }
 }
@@ -577,12 +556,14 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
+        let white_as_u8_slice = [0xFF, 0xFF, 0xFF, 0xFF];
+        let image_info = ImageInfo::white_texture(default_sampler.clone());
         let white_tex = create_image(
-            &self.graphics_queue,
-            &self.command_buffer_allocator,
-            &self.memory_allocator,
-            0xFF,
-            default_sampler.clone(),
+            self.graphics_queue.clone(),
+            self.command_buffer_allocator.clone(),
+            self.memory_allocator.clone(),
+            &white_as_u8_slice,
+            image_info,
         );
 
         let mesh_registry = load_meshes_from_directory(
@@ -596,7 +577,7 @@ impl ApplicationHandler for App {
         let mut mesh_streams = HashMap::new();
 
         let meshes = mesh_registry.clone();
-        for (_name, mesh) in meshes.read().unwrap().iter() {
+        for (handle, mesh) in meshes.read().unwrap().iter() {
             let draw_count = mesh.lods.len() * mesh.submeshes.len();
 
             let indirect: [Subbuffer<_>; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|_| {
@@ -661,7 +642,7 @@ impl ApplicationHandler for App {
                 });
 
             mesh_streams.insert(
-                mesh.clone(),
+                handle,
                 MeshDrawStream {
                     mesh: mesh.clone(),
                     indirect,
@@ -736,25 +717,33 @@ impl ApplicationHandler for App {
         {
             let registry = mesh_registry.read().unwrap();
 
+            let viking_handle = registry.resolve("viking_room").unwrap();
+            let suzanne_handle = registry.resolve("suzanne").unwrap();
+
             for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
-                self.scene.world.push((
-                    Transform { trs },
+                self.scene.add_entity((
+                    Transform { transform: trs },
                     MeshComponent {
-                        mesh: registry.get("viking_room").unwrap().clone(),
+                        mesh: viking_handle,
                     },
                     Visible,
                 ));
             }
 
             for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
-                self.scene.world.push((
-                    Transform { trs },
+                self.scene.add_entity((
+                    Transform { transform: trs },
                     MeshComponent {
-                        mesh: registry.get("suzanne").unwrap().clone(),
+                        mesh: suzanne_handle,
                     },
                     Visible,
                 ));
             }
+
+            self.scene
+                .save_to_file(Path::new("scene_save.scene"))
+                .unwrap();
+            self.scene = Scene::load_from_file(Path::new("scene_save.scene")).unwrap();
         }
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
@@ -849,14 +838,11 @@ impl ApplicationHandler for App {
                             println!("Winding: {:?}", self.clockwise_front_face);
                         }
                         PhysicalKey::Code(KeyCode::KeyY) => {
-                            let lod_count = self
-                                .rcx
-                                .as_ref()
-                                .unwrap()
-                                .meshes
-                                .read()
-                                .unwrap()
-                                .get("viking_room")
+                            let registry = self.rcx.as_ref().unwrap().meshes.read().unwrap();
+
+                            let lod_count = registry
+                                .resolve("viking_room")
+                                .map(|m| registry.get(m))
                                 .unwrap()
                                 .lods
                                 .len();
@@ -926,73 +912,11 @@ impl ApplicationHandler for App {
     }
 }
 
-fn create_image(
-    queue: &Arc<Queue>,
-    cb_allocator: &Arc<StandardCommandBufferAllocator>,
-    allocator: &Arc<StandardMemoryAllocator>,
-    value: i32,
-    sampler: Arc<Sampler>,
-) -> Arc<ImageViewSampler> {
-    let img = Image::new(
-        allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::R8G8B8A8_UNORM,
-            extent: [1, 1, 1],
-            mip_levels: 1,
-            array_layers: 1,
-            samples: SampleCount::Sample1,
-            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
-            initial_layout: vulkano::image::ImageLayout::Undefined,
-            ..Default::default()
-        },
-        Default::default(),
-    )
-    .unwrap();
-
-    allocator
-        .device()
-        .set_debug_utils_object_name(&img, Some("White Renderer Texture"))
-        .unwrap();
-
-    {
-        // Perform a clear to the specified value
-        let mut builder = AutoCommandBufferBuilder::primary(
-            cb_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        let val_as_f32 = if value > 1 {
-            value as f32 / 255.0
-        } else {
-            value as f32
-        };
-
-        let mut clear_info = ClearColorImageInfo::image(img.clone());
-        clear_info.clear_value =
-            ClearColorValue::Float([val_as_f32, val_as_f32, val_as_f32, 1.0f32]);
-
-        builder.clear_color_image(clear_info).unwrap();
-
-        let result = builder.build().unwrap().execute(queue.clone()).unwrap();
-        result
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
-    }
-
-    Arc::new(ImageViewSampler::new(
-        ImageView::new_default(img.clone()).unwrap(),
-        sampler,
-    ))
-}
-
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
+        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
             .size([300.0, 100.0], Condition::FirstUseEver)
@@ -1015,7 +939,11 @@ impl App {
 
         self.scene.update();
 
-        let mut submission = self.scene.resources.get_mut::<FrameSubmission>().unwrap();
+        let mut submission = self
+            .scene
+            .resources_mut()
+            .get_mut::<FrameSubmission>()
+            .unwrap();
 
         submission.drain_draws_into(&mut rcx.frame_submission.draws);
         rcx.build_frame(self.memory_allocator.clone());
@@ -1086,7 +1014,7 @@ impl App {
             rcx.recreate_swapchain = true;
         }
 
-        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+        // acquire_future.wait(None).unwrap();
 
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
@@ -1581,13 +1509,13 @@ impl RenderContext {
     fn build_frame(&mut self, allocator: Arc<StandardMemoryAllocator>) {
         let submission = &self.frame_submission;
 
-        let mut buckets: HashMap<Arc<MeshAsset>, Vec<&DrawSubmission>> = HashMap::new();
+        let mut buckets: HashMap<MeshHandle, Vec<&DrawSubmission>> = HashMap::new();
         for draw in &submission.draws {
-            buckets.entry(draw.mesh.clone()).or_default().push(draw);
+            buckets.entry(draw.mesh).or_default().push(draw);
         }
 
-        for (mesh, draws) in buckets {
-            let stream = self.mesh_streams.get_mut(&mesh).unwrap();
+        for (mesh_handle, draws) in buckets {
+            let stream = self.mesh_streams.get_mut(&mesh_handle).unwrap();
 
             let required = draws.len();
 
@@ -1633,158 +1561,6 @@ impl RenderContext {
     }
 }
 
-mod predepth {
-    pub mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            vulkan_version: "1.3",
-            spirv_version: "1.6",
-            path: "assets/shaders/predepth.vert",
-        }
-    }
-
-    pub mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r"
-                #version 450
-                void main() { }
-            "
-        }
-    }
-}
-
-mod mrt {
-    pub mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            vulkan_version: "1.3",
-            spirv_version: "1.6",
-            path: "assets/shaders/instanced_mrt.vert",
-        }
-    }
-
-    pub mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            vulkan_version: "1.3",
-            spirv_version: "1.6",
-            path: "./assets/shaders/instanced_mrt.frag",
-            include: ["./assets/shaders/include"],
-        }
-    }
-}
-
-mod fullscreen {
-
-    pub mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: r"
-                        #version 450
-                        layout(location = 0) out vec2 uvs;
-                        void main() {
-                            uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-                            gl_Position = vec4(uvs * 2.0 - 1.0, 0.0, 1.0);
-                        }
-                    ",
-        }
-    }
-
-    pub mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r"
-                        #version 450
-                        layout(location = 0) in vec2 uvs;
-                        layout(location = 0) out vec4 f_color;
-
-                        layout(set=0, binding=0) uniform sampler2D composite_output;
-
-                        vec3 aces(vec3 x) {
-                            return clamp((x*(2.51*x+0.03)) / (x*(2.43*x+0.59)+0.14), 0.0, 1.0);
-                        }
-
-                        vec3 linear_to_srgb(vec3 x){
-                            return pow(x, vec3(1.0/2.2));
-                        }
-
-                        void main(){
-                            vec3 color = texture(composite_output, uvs).xyz;
-                            color = linear_to_srgb(aces(color));
-                            f_color = vec4(color,1.0);
-                        }
-                    ",
-        }
-    }
-}
-
-mod composite {
-    pub mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: r"
-                        #version 450
-                        layout(location = 0) out vec2 v_uvs;
-                        void main(){
-                            v_uvs = vec2((gl_VertexIndex<<1)&2, gl_VertexIndex&2);
-                            gl_Position = vec4(v_uvs*2.0 + -1.0,0.0,1.0);
-                        }
-                    "
-        }
-    }
-
-    pub mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r"
-                        #version 450
-
-                        layout(location = 0) in vec2 v_uvs;
-                        layout(location = 0) out vec4 out_color;
-
-                        layout(set=0, binding=0) uniform sampler2D hdr_tex;
-                        layout(set=0, binding=1) uniform sampler2D bloom_tex;
-
-                        layout (push_constant) uniform PC {
-                            float bloom_strength;
-                        };
-
-                        void main() {
-                            vec3 hdr = texture(hdr_tex, v_uvs).rgb;
-                            vec3 bloom = texture(bloom_tex, v_uvs).rgb;
-
-                            float bloom_final_strength = max(bloom_strength, 1.0);
-                            out_color = vec4(hdr + bloom * bloom_final_strength, 1.0);
-                        }
-                    "
-        }
-    }
-}
-
-mod mrt_light {
-    pub mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: r"
-                        #version 450
-                        layout(location = 0) out vec2 v_uvs;
-                        void main() {
-                            v_uvs = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-                            gl_Position = vec4(v_uvs * 2.0 + -1.0, 0.0, 1.0);
-                        }
-                    "
-        }
-    }
-
-    pub mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            path: "assets/shaders/mrt_lighting.frag",
-        }
-    }
-}
-
 fn window_size_dependent_setup(
     device: &Arc<Device>,
     memory_allocator: &Arc<GenericMemoryAllocator<FreeListAllocator>>,
@@ -1793,11 +1569,11 @@ fn window_size_dependent_setup(
     swapchain_images: &[Arc<Image>],
 ) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
     let predepth_pipeline = {
-        let vs = predepth::vs::load(device.clone())
+        let vs = engine_shaders::predepth::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = predepth::fs::load(device.clone())
+        let fs = engine_shaders::predepth::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -1873,11 +1649,11 @@ fn window_size_dependent_setup(
     };
 
     let mrt_instanced_pipeline = {
-        let vs = mrt::vs::load(device.clone())
+        let vs = engine_shaders::mrt::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = mrt::fs::load(device.clone())
+        let fs = engine_shaders::mrt::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -2075,11 +1851,11 @@ fn window_size_dependent_setup(
     // === MRT LIGHTING PASS (UBO + GBUFFER INPUT)
     // ==============================================================
     let mrt_lighting = {
-        let vs = mrt_light::vs::load(device.clone())
+        let vs = engine_shaders::mrt_light::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = mrt_light::fs::load(device.clone())
+        let fs = engine_shaders::mrt_light::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -2223,11 +1999,11 @@ fn window_size_dependent_setup(
     .unwrap();
 
     let composite = {
-        let vs = composite::vs::load(device.clone())
+        let vs = engine_shaders::composite::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = composite::fs::load(device.clone())
+        let fs = engine_shaders::composite::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -2279,7 +2055,7 @@ fn window_size_dependent_setup(
                 push_constant_ranges: [PushConstantRange {
                     stages: ShaderStages::FRAGMENT,
                     offset: 0,
-                    size: std::mem::size_of::<composite::fs::PC>() as _,
+                    size: std::mem::size_of::<engine_shaders::composite::fs::PC>() as _,
                 }]
                 .to_vec(),
                 ..Default::default()
@@ -2326,11 +2102,11 @@ fn window_size_dependent_setup(
     // === SWAPCHAIN PASS (unchanged)
     // ==============================================================
     let swapchain_pass = {
-        let vs = fullscreen::vs::load(device.clone())
+        let vs = engine_shaders::fullscreen::vs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = fullscreen::fs::load(device.clone())
+        let fs = engine_shaders::fullscreen::fs::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
