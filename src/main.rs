@@ -107,7 +107,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const INSTANCE_COUNT: DeviceSize = 200;
+const INSTANCE_COUNT: DeviceSize = 20000;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -118,11 +118,10 @@ fn main() -> Result<(), impl Error> {
 
 struct MeshDrawStream {
     mesh: Arc<MeshAsset>,
-    indirect: Subbuffer<[DrawIndexedIndirectCommand]>,
+    instance_count: u32,
     material_ids: Subbuffer<[u32]>,
-
+    indirect: [Subbuffer<[DrawIndexedIndirectCommand]>; MAX_FRAMES_IN_FLIGHT],
     transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
-    instance_count: u32, // ← NEW
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -600,26 +599,28 @@ impl ApplicationHandler for App {
         for (_name, mesh) in meshes.read().unwrap().iter() {
             let draw_count = mesh.lods.len() * mesh.submeshes.len();
 
-            let indirect = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                mesh.submeshes.iter().map(|sub| DrawIndexedIndirectCommand {
-                    index_count: sub.index_count,
-                    instance_count: 0,
-                    first_index: sub.first_index,
-                    vertex_offset: 0,
-                    first_instance: 0,
-                }),
-            )
-            .unwrap();
+            let indirect: [Subbuffer<_>; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|_| {
+                Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    mesh.submeshes.iter().map(|sub| DrawIndexedIndirectCommand {
+                        index_count: sub.index_count,
+                        instance_count: 0,
+                        first_index: sub.first_index,
+                        vertex_offset: 0,
+                        first_instance: 0,
+                    }),
+                )
+                .unwrap()
+            });
 
             let material_ids = Buffer::new_slice::<u32>(
                 self.memory_allocator.clone(),
@@ -656,7 +657,7 @@ impl ApplicationHandler for App {
                         },
                         1,
                     )
-                        .unwrap()
+                    .unwrap()
                 });
 
             mesh_streams.insert(
@@ -1008,7 +1009,7 @@ impl App {
                 ));
             });
 
-        rcx.winit_platform.prepare_render(ui, &rcx.window); // step 5
+        rcx.winit_platform.prepare_render(ui, &rcx.window);
 
         rcx.frame_submission.clear_all();
 
@@ -1035,6 +1036,12 @@ impl App {
         }
 
         if rcx.recreate_swapchain {
+            // TODO: I have no idea why this is required, since I think I got sync correctly done. But
+            // obviously I am wrong.
+            unsafe {
+                self.device.wait_idle().unwrap();
+            }
+
             let (new_swapchain, new_swapchain_images) = rcx
                 .swapchain
                 .recreate(SwapchainCreateInfo {
@@ -1146,7 +1153,10 @@ impl App {
                 let set_1 = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     layout.clone(),
-                    [WriteDescriptorSet::buffer(1, stream.transforms[rcx.frame_index()].clone())],
+                    [WriteDescriptorSet::buffer(
+                        1,
+                        stream.transforms[rcx.frame_index()].clone(),
+                    )],
                     [],
                 )
                 .unwrap();
@@ -1166,7 +1176,7 @@ impl App {
 
                 unsafe {
                     graphics_builder
-                        .draw_indexed_indirect(stream.indirect.clone())
+                        .draw_indexed_indirect(stream.indirect[rcx.frame_index()].clone())
                         .unwrap();
                 }
             }
@@ -1305,7 +1315,7 @@ impl App {
 
                 unsafe {
                     graphics_builder
-                        .draw_indexed_indirect(stream.indirect.clone())
+                        .draw_indexed_indirect(stream.indirect[rcx.frame_index()].clone())
                         .unwrap();
                 }
             }
@@ -1536,8 +1546,6 @@ impl App {
 
         let cmd_buf = graphics_builder.build().unwrap();
 
-        acquire_future.wait(None).unwrap();
-
         let future = rcx
             .previous_frame_end
             .take()
@@ -1550,8 +1558,6 @@ impl App {
                 SwapchainPresentInfo::swapchain_image_index(rcx.swapchain.clone(), image_index),
             )
             .then_signal_fence_and_flush();
-
-
 
         match future.map_err(Validated::unwrap) {
             Ok(f) => rcx.previous_frame_end = Some(f.boxed()),
@@ -1588,23 +1594,22 @@ impl RenderContext {
             if stream.transforms.len() < required {
                 let new_capacity = required.next_power_of_two().max(1);
 
-                stream.transforms =
-                    std::array::from_fn(|_| {
-                        Buffer::new_slice::<TransformTRS>(
-                            allocator.clone(),
-                            BufferCreateInfo {
-                                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                                ..Default::default()
-                            },
-                            AllocationCreateInfo {
-                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                                ..Default::default()
-                            },
-                            new_capacity as DeviceSize,
-                        )
-                            .unwrap()
-                    });
+                stream.transforms = std::array::from_fn(|_| {
+                    Buffer::new_slice::<TransformTRS>(
+                        allocator.clone(),
+                        BufferCreateInfo {
+                            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                            ..Default::default()
+                        },
+                        AllocationCreateInfo {
+                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                            ..Default::default()
+                        },
+                        new_capacity as DeviceSize,
+                    )
+                    .unwrap()
+                });
             }
 
             if let Ok(mut w) = stream.transforms[self.current_frame].write() {
@@ -1615,7 +1620,7 @@ impl RenderContext {
 
             stream.instance_count = required as u32;
 
-            if let Ok(mut cmds) = stream.indirect.write() {
+            if let Ok(mut cmds) = stream.indirect[self.current_frame].write() {
                 for cmd in cmds.iter_mut() {
                     cmd.first_instance = 0;
                     cmd.instance_count = stream.instance_count;
