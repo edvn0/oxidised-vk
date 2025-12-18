@@ -1,5 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc};
+use crate::{
+    MAX_FRAMES_IN_FLIGHT,
+    image::{ImageInfo, create_image},
+    imgui::shaders,
+    mesh::ImageViewSampler,
+};
 use imgui::{DrawCmd, DrawData};
+use std::{collections::BTreeMap, sync::Arc};
+use vulkano::pipeline::DynamicState;
+use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -38,11 +48,6 @@ use vulkano::{
     shader::ShaderStages,
     sync::GpuFuture,
 };
-use vulkano::pipeline::DynamicState;
-use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
-use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
-use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
-use crate::{MAX_FRAMES_IN_FLIGHT, image::{ImageInfo, create_image}, imgui::shaders, mesh::ImageViewSampler};
 
 #[repr(C)]
 #[derive(BufferContents, Copy, Clone)]
@@ -75,7 +80,7 @@ pub struct ImGuiRenderer {
 
     sampler_clamp: Arc<Sampler>,
 
-    frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT],
+    frames: FrameBuffers,
 }
 
 impl ImGuiRenderer {
@@ -107,15 +112,13 @@ impl ImGuiRenderer {
             sampler_clamp.clone(),
         );
 
-        let frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|_| Self::empty_frame(allocator.clone()));
-
         Self {
-            allocator,
+            allocator: allocator.clone(),
             descriptor_set_allocator,
             pipeline,
             texture_set: set,
             free_texture_ids: Vec::new(),
-            frames,
+            frames: Self::empty_frame(allocator.clone()),
             sampler_clamp,
             textures: Vec::new(),
         }
@@ -130,7 +133,12 @@ impl ImGuiRenderer {
         let fonts = imgui.fonts();
         let atlas = fonts.build_rgba32_texture();
 
-        let image_info = ImageInfo::new([atlas.width as u32, atlas.height as u32], Format::R8G8B8A8_UNORM, String::from("Font Atlas"), self.sampler_clamp.clone());
+        let image_info = ImageInfo::new(
+            [atlas.width as u32, atlas.height as u32],
+            Format::R8G8B8A8_UNORM,
+            String::from("Font Atlas"),
+            self.sampler_clamp.clone(),
+        );
 
         let tex = create_image(
             queue.clone(),
@@ -148,9 +156,8 @@ impl ImGuiRenderer {
         &mut self,
         cmd: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         draw_data: &DrawData,
-        frame_index: usize,
     ) {
-        let fb = &mut self.frames[frame_index];
+        let fb = &mut self.frames;
 
         ensure_capacity(&self.allocator, fb, draw_data);
         upload_buffers(cmd, fb, draw_data);
@@ -160,10 +167,9 @@ impl ImGuiRenderer {
         &self,
         cmd: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         draw_data: &DrawData,
-        frame_index: usize,
         vp: (&Viewport, &Scissor),
     ) {
-        let fb = &self.frames[frame_index];
+        let fb = &self.frames;
 
         let vb_addr = fb.vb_gpu.device_address().unwrap();
         let ib = fb.ib_gpu.clone();
@@ -207,8 +213,10 @@ impl ImGuiRenderer {
                     .unwrap()
                     .set_depth_write_enable(false)
                     .unwrap()
-                    .set_scissor(0, [scissor.clone()].into_iter().collect()).unwrap()
-                .set_viewport(0, [viewport.clone()].into_iter().collect()).unwrap();
+                    .set_scissor(0, [scissor.clone()].into_iter().collect())
+                    .unwrap()
+                    .set_viewport(0, [viewport.clone()].into_iter().collect())
+                    .unwrap();
                 unsafe {
                     cmd.draw_indexed(
                         count as u32,
@@ -257,7 +265,6 @@ impl ImGuiRenderer {
         self.rebuild_texture_set();
         id
     }
-
 
     fn empty_frame(allocator: Arc<StandardMemoryAllocator>) -> FrameBuffers {
         let ib = Buffer::new_slice(
@@ -451,8 +458,7 @@ fn upload_buffers(
             d.col = s.col;
         }
 
-        idx[io..io + list.idx_buffer().len()]
-            .copy_from_slice(list.idx_buffer());
+        idx[io..io + list.idx_buffer().len()].copy_from_slice(list.idx_buffer());
 
         vo += list.vtx_buffer().len();
         io += list.idx_buffer().len();
@@ -462,15 +468,14 @@ fn upload_buffers(
         fb.vb_staging.clone(),
         fb.vb_gpu.clone(),
     ))
-        .unwrap();
+    .unwrap();
 
     cmd.copy_buffer(CopyBufferInfo::buffers(
         fb.ib_staging.clone(),
         fb.ib_gpu.clone(),
     ))
-        .unwrap();
+    .unwrap();
 }
-
 
 fn ensure_capacity(
     allocator: &Arc<StandardMemoryAllocator>,

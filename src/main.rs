@@ -915,7 +915,6 @@ impl ApplicationHandler for App {
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
-        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
@@ -957,8 +956,6 @@ impl App {
         let window_size = rcx.window.inner_size();
         rcx.elapsed_millis = rcx.start_time.elapsed().as_millis() as u64;
 
-        // Do not draw the frame when the screen size is zero. On Windows, this can occur
-        // when minimizing the application.
         if window_size.width == 0 || window_size.height == 0 {
             return;
         }
@@ -1013,8 +1010,6 @@ impl App {
         if suboptimal {
             rcx.recreate_swapchain = true;
         }
-
-        // acquire_future.wait(None).unwrap();
 
         let mut graphics_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
@@ -1426,8 +1421,7 @@ impl App {
                     ..Default::default()
                 })
                 .unwrap();
-            rcx.imgui_renderer
-                .upload(&mut graphics_builder, draw_data, rcx.current_frame);
+            rcx.imgui_renderer.upload(&mut graphics_builder, draw_data);
             unsafe {
                 graphics_builder.end_debug_utils_label().unwrap();
             }
@@ -1457,7 +1451,6 @@ impl App {
             rcx.imgui_renderer.draw(
                 &mut graphics_builder,
                 draw_data,
-                rcx.current_frame,
                 (&rcx.viewport, &rcx.scissor),
             );
 
@@ -1523,7 +1516,8 @@ impl RenderContext {
             if current.len() < required as u64 {
                 let new_capacity = required
                     .checked_next_power_of_two()
-                    .unwrap_or(required as usize);
+                    .unwrap_or(required as usize)
+                    .max(1);
 
                 for slot in &mut stream.transforms {
                     *slot = Buffer::new_slice::<TransformTRS>(
