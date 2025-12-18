@@ -1591,11 +1591,14 @@ impl RenderContext {
 
             let required = draws.len();
 
-            if stream.transforms.len() < required {
-                let new_capacity = required.next_power_of_two().max(1);
+            let current = &stream.transforms[self.current_frame];
+            if current.len() < required as u64 {
+                let new_capacity = required
+                    .checked_next_power_of_two()
+                    .unwrap_or(required as usize);
 
-                stream.transforms = std::array::from_fn(|_| {
-                    Buffer::new_slice::<TransformTRS>(
+                for slot in &mut stream.transforms {
+                    *slot = Buffer::new_slice::<TransformTRS>(
                         allocator.clone(),
                         BufferCreateInfo {
                             usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
@@ -1608,8 +1611,8 @@ impl RenderContext {
                         },
                         new_capacity as DeviceSize,
                     )
-                    .unwrap()
-                });
+                    .unwrap();
+                }
             }
 
             if let Ok(mut w) = stream.transforms[self.current_frame].write() {
