@@ -12,7 +12,7 @@ use vulkano::{
         Image, ImageCreateInfo, ImageUsage, max_mip_levels, sampler::Sampler, view::ImageView,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    sync::{self, GpuFuture},
+    sync::GpuFuture,
 };
 
 use crate::mesh::ImageViewSampler;

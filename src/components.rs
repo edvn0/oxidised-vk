@@ -1,7 +1,5 @@
 use crate::TransformTRS;
-use crate::mesh::MeshAsset;
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
-use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub struct Transform {

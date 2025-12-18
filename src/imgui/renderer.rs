@@ -1,5 +1,4 @@
 use crate::{
-    MAX_FRAMES_IN_FLIGHT,
     image::{ImageInfo, create_image},
     imgui::shaders,
     mesh::ImageViewSampler,
@@ -13,8 +12,7 @@ use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CopyBufferInfo, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
-        PrimaryCommandBufferAbstract, allocator::StandardCommandBufferAllocator,
+        AutoCommandBufferBuilder, CopyBufferInfo, PrimaryAutoCommandBuffer, allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
         DescriptorSet, WriteDescriptorSet,
@@ -26,11 +24,7 @@ use vulkano::{
     },
     device::{Device, Queue},
     format::Format,
-    image::{
-        Image, ImageCreateInfo, ImageType, ImageUsage,
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
-        view::ImageView,
-    },
+    image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
@@ -46,7 +40,6 @@ use vulkano::{
         layout::{PipelineLayout, PipelineLayoutCreateInfo, PushConstantRange},
     },
     shader::ShaderStages,
-    sync::GpuFuture,
 };
 
 #[repr(C)]
@@ -80,7 +73,7 @@ pub struct ImGuiRenderer {
 
     sampler_clamp: Arc<Sampler>,
 
-    frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT],
+    frames: Vec<FrameBuffers>,
 }
 
 impl ImGuiRenderer {
@@ -89,6 +82,7 @@ impl ImGuiRenderer {
         allocator: Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         image_format: Format,
+        image_count: usize,
     ) -> Self {
         let sampler_clamp = Sampler::new(
             device.clone(),
@@ -112,8 +106,9 @@ impl ImGuiRenderer {
             sampler_clamp.clone(),
         );
 
-        let frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT] =
-            std::array::from_fn(|_| Self::empty_frame(allocator.clone()));
+        let frames: Vec<FrameBuffers> = (0..image_count).map(|_|
+            Self::empty_frame(allocator.clone())
+        ).collect();
 
         Self {
             allocator,
@@ -163,7 +158,7 @@ impl ImGuiRenderer {
     ) {
         let fb = &mut self.frames[frame_index];
 
-        ensure_capacity(&self.allocator, fb, draw_data);
+        fb.ensure_capacity(&self.allocator, draw_data);
         upload_buffers(cmd, fb, draw_data);
     }
 
@@ -237,6 +232,16 @@ impl ImGuiRenderer {
             idx_offset += list.idx_buffer().len() as u32;
             vtx_offset += list.vtx_buffer().len();
         }
+    }
+
+pub fn resize(&mut self, image_count: usize) {
+        if self.frames.len() == image_count {
+            return;
+        }
+
+        self.frames = (0..image_count)
+            .map(|_| Self::empty_frame(self.allocator.clone()))
+            .collect();
     }
 
     fn rebuild_texture_set(&mut self) {
@@ -482,16 +487,36 @@ fn upload_buffers(
     .unwrap();
 }
 
-fn ensure_capacity(
-    allocator: &Arc<StandardMemoryAllocator>,
-    fb: &mut FrameBuffers,
-    draw_data: &DrawData,
-) {
-    let total_vtx = draw_data.total_vtx_count as usize;
-    let total_idx = draw_data.total_idx_count as usize;
+impl FrameBuffers {
+    fn grow_capacity(required: usize) -> usize {
+    required.next_power_of_two().max(64)
+}
 
-    if total_vtx > fb.vtx_capacity {
-        fb.vb_staging = Buffer::new_slice(
+    pub fn ensure_capacity(
+        &mut self,
+        allocator: &Arc<StandardMemoryAllocator>,
+        draw_data: &DrawData,
+    ) {
+        let total_vtx = draw_data.total_vtx_count as usize;
+        let total_idx = draw_data.total_idx_count as usize;
+
+        if total_vtx > self.vtx_capacity {
+            let new_capacity = Self::grow_capacity(total_vtx);
+            self.resize_vertices(allocator, new_capacity);
+        }
+
+        if total_idx > self.idx_capacity {
+            let new_capacity = Self::grow_capacity(total_idx);
+            self.resize_indices(allocator, new_capacity);
+        }
+    }
+
+    fn resize_vertices(
+        &mut self,
+        allocator: &Arc<StandardMemoryAllocator>,
+        new_capacity: usize,
+    ) {
+        self.vb_staging = Buffer::new_slice(
             allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -501,11 +526,11 @@ fn ensure_capacity(
                 memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            total_vtx as u64,
+            new_capacity as u64,
         )
         .unwrap();
 
-        fb.vb_gpu = Buffer::new_slice(
+        self.vb_gpu = Buffer::new_slice(
             allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::STORAGE_BUFFER
@@ -517,15 +542,19 @@ fn ensure_capacity(
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            total_vtx as u64,
+            new_capacity as u64,
         )
         .unwrap();
 
-        fb.vtx_capacity = total_vtx;
+        self.vtx_capacity = new_capacity;
     }
 
-    if total_idx > fb.idx_capacity {
-        fb.ib_staging = Buffer::new_slice(
+    fn resize_indices(
+        &mut self,
+        allocator: &Arc<StandardMemoryAllocator>,
+        new_capacity: usize,
+    ) {
+        self.ib_staging = Buffer::new_slice(
             allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -535,11 +564,11 @@ fn ensure_capacity(
                 memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            total_idx as u64,
+            new_capacity as u64,
         )
         .unwrap();
 
-        fb.ib_gpu = Buffer::new_slice(
+        self.ib_gpu = Buffer::new_slice(
             allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
@@ -549,10 +578,10 @@ fn ensure_capacity(
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            total_idx as u64,
+            new_capacity as u64,
         )
         .unwrap();
 
-        fb.idx_capacity = total_idx;
+        self.idx_capacity = new_capacity;
     }
 }

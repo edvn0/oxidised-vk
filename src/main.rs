@@ -25,7 +25,7 @@ use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
-use crate::scene::{Scene, WorldExt};
+use crate::scene::Scene;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
@@ -121,10 +121,10 @@ fn main() -> Result<(), impl Error> {
 
 struct MeshDrawStream {
     mesh: Arc<MeshAsset>,
-    indirect: Subbuffer<[DrawIndexedIndirectCommand]>,
     material_ids: Subbuffer<[u32]>,
-
-    transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
+    
+    indirect: Vec<Subbuffer<[DrawIndexedIndirectCommand]>>,
+    transforms: Vec<Subbuffer<[TransformTRS]>>,
     instance_count: u32, // ← NEW
 }
 
@@ -238,8 +238,6 @@ pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
 
-const MAX_FRAMES_IN_FLIGHT: usize = 3;
-
 struct FrameResources {
     uniform_buffer: Subbuffer<RendererUBO>,
 }
@@ -250,7 +248,7 @@ struct RenderContext {
     viewport: Viewport,
     scissor: Scissor,
     recreate_swapchain: bool,
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    frame_futures: Vec<Option<Box<dyn GpuFuture>>>,
     start_time: Instant,
     elapsed_millis: u64,
 
@@ -262,7 +260,6 @@ struct RenderContext {
     context_descriptor_set: FrameDescriptorSet,
 
     frame_submission: FrameSubmission,
-    current_frame: usize,
     frames: Vec<FrameResources>,
 
     mrt_pass: MRT,
@@ -277,10 +274,6 @@ struct RenderContext {
 }
 
 impl RenderContext {
-    pub fn frame_index(&self) -> usize {
-        self.current_frame
-    }
-
     pub fn update_camera_ubo(
         &self,
         camera: &Camera,
@@ -491,7 +484,7 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut attribs = Window::default_attributes();
+        let mut attribs = Window::default_attributes(); //.with_fullscreen(Some(Fullscreen::Borderless(None)));
         attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
         let window = Arc::new(event_loop.create_window(attribs).unwrap());
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
@@ -521,8 +514,7 @@ impl ApplicationHandler for App {
                 surface,
                 SwapchainCreateInfo {
                     min_image_count: surface_capabilities
-                        .min_image_count
-                        .max(MAX_FRAMES_IN_FLIGHT as u32),
+                        .min_image_count,
 
                     image_format,
                     image_extent: window_size.into(),
@@ -581,7 +573,7 @@ impl ApplicationHandler for App {
         for (handle, mesh) in meshes.read().unwrap().iter() {
             let draw_count = mesh.lods.len() * mesh.submeshes.len();
 
-            let indirect = Buffer::from_iter(
+            let indirect =(0..swapchain.image_count() as usize).map(|_| Buffer::from_iter(
                 self.memory_allocator.clone(),
                 BufferCreateInfo {
                     usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
@@ -599,8 +591,7 @@ impl ApplicationHandler for App {
                     vertex_offset: 0,
                     first_instance: 0,
                 }),
-            )
-            .unwrap();
+            ).unwrap()).collect::<Vec<_>>();
 
             let material_ids = Buffer::new_slice::<u32>(
                 self.memory_allocator.clone(),
@@ -622,9 +613,7 @@ impl ApplicationHandler for App {
                 update_material_ids_for_mesh(mesh, &mut w);
             }
 
-            let transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT] =
-                std::array::from_fn(|_| {
-                    Buffer::new_slice::<TransformTRS>(
+            let transforms: Vec<Subbuffer<[TransformTRS]>> = (0..swapchain.image_count() as usize).map(|_|                    Buffer::new_slice::<TransformTRS>(
                         self.memory_allocator.clone(),
                         BufferCreateInfo {
                             usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
@@ -638,7 +627,7 @@ impl ApplicationHandler for App {
                         1,
                     )
                     .unwrap()
-                });
+                ).collect();
 
             mesh_streams.insert(
                 handle,
@@ -675,7 +664,7 @@ impl ApplicationHandler for App {
         let recreate_swapchain = false;
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
 
-        let uniform_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+        let uniform_buffers = (0..swapchain.image_count())
             .map(|_| {
                 Buffer::new_sized::<RendererUBO>(
                     self.memory_allocator.clone(),
@@ -752,6 +741,7 @@ impl ApplicationHandler for App {
             self.memory_allocator.clone(),
             self.descriptor_set_allocator.clone(),
             swapchain.image_format(),
+            swapchain.image_count() as usize,
         );
 
         renderer.upload_font_atlas(
@@ -763,10 +753,16 @@ impl ApplicationHandler for App {
         let mut platform = WinitPlatform::new(&mut imgui); // step 1
         platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
 
-        let frames = (0..MAX_FRAMES_IN_FLIGHT)
+        let frames = (0..swapchain.image_count() as usize)
             .map(|i| FrameResources {
                 uniform_buffer: uniform_buffers[i].clone(),
             })
+            .collect();
+
+        let image_count = swapchain.image_count() as usize;
+
+        let frame_futures = (0..image_count)
+            .map(|_| Some(sync::now(self.device.clone()).boxed()))
             .collect();
 
         self.rcx = Some(RenderContext {
@@ -776,13 +772,13 @@ impl ApplicationHandler for App {
             viewport,
             scissor,
             recreate_swapchain,
-            previous_frame_end,
+            frame_futures,
             start_time: Instant::now(),
             elapsed_millis: 0,
             context_descriptor_set: FrameDescriptorSet::new(
                 self.device.clone(),
                 self.descriptor_set_allocator.clone(),
-                &uniform_buffers[..MAX_FRAMES_IN_FLIGHT],
+                &uniform_buffers[..image_count],
             ),
             white_image_sampler: white_tex,
             mrt_pass: mrt,
@@ -797,7 +793,6 @@ impl ApplicationHandler for App {
             winit_platform: platform,
             imgui_context: imgui,
             imgui_renderer: renderer,
-            current_frame: 0,
             frames,
         });
     }
@@ -931,11 +926,9 @@ impl App {
             });
 
         rcx.winit_platform.prepare_render(ui, &rcx.window); // step 5
-
         rcx.frame_submission.clear_all();
 
         self.scene.update();
-
         let mut submission = self
             .scene
             .resources_mut()
@@ -943,7 +936,6 @@ impl App {
             .unwrap();
 
         submission.drain_draws_into(&mut rcx.frame_submission.draws);
-        rcx.build_frame(self.memory_allocator.clone());
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -968,6 +960,9 @@ impl App {
                 .expect("failed to recreate swapchain");
 
             rcx.swapchain = new_swapchain;
+            rcx.frame_futures = (0..rcx.swapchain.image_count() as usize)
+                .map(|_| Some(sync::now(self.device.clone()).boxed()))
+                .collect();
 
             let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
                 window_size_dependent_setup(
@@ -985,6 +980,8 @@ impl App {
 
             rcx.viewport.extent = [window_size.width as f32, window_size.height as f32];
             rcx.scissor.extent = window_size.into();
+            
+            rcx.imgui_renderer.resize(rcx.swapchain.image_count() as usize);
 
             rcx.recreate_swapchain = false;
         }
@@ -999,6 +996,10 @@ impl App {
                 Err(e) => panic!("failed to acquire next image: {e}"),
             };
 
+        let idx = image_index as usize;
+        rcx.build_frame(idx, self.memory_allocator.clone());
+
+
         if suboptimal {
             rcx.recreate_swapchain = true;
         }
@@ -1010,7 +1011,7 @@ impl App {
         )
         .unwrap();
 
-        rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
+        rcx.update_camera_ubo(&self.camera, idx, window_size);
 
         {
             graphics_builder
@@ -1056,7 +1057,7 @@ impl App {
                     rcx.mrt_pass.predepth_pipeline.layout().clone(),
                     0,
                     [rcx.context_descriptor_set
-                        .for_frame(rcx.current_frame)
+                        .for_frame(idx)
                         .clone()]
                     .to_vec(),
                 )
@@ -1070,7 +1071,7 @@ impl App {
                     layout.clone(),
                     [WriteDescriptorSet::buffer(
                         1,
-                        stream.transforms[rcx.frame_index()].clone(),
+                        stream.transforms[idx].clone(),
                     )],
                     [],
                 )
@@ -1091,7 +1092,7 @@ impl App {
 
                 unsafe {
                     graphics_builder
-                        .draw_indexed_indirect(stream.indirect.clone())
+                        .draw_indexed_indirect(stream.indirect[idx].clone())
                         .unwrap();
                 }
             }
@@ -1174,7 +1175,7 @@ impl App {
                     rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
                     0,
                     [rcx.context_descriptor_set
-                        .for_frame(rcx.current_frame)
+                        .for_frame(idx)
                         .clone()]
                     .to_vec(),
                 )
@@ -1207,7 +1208,7 @@ impl App {
                                 )))
                                 .take(256),
                         ),
-                        WriteDescriptorSet::buffer(1, stream.transforms[rcx.frame_index()].clone()),
+                        WriteDescriptorSet::buffer(1, stream.transforms[idx].clone()),
                         WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
                         WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
                     ],
@@ -1230,7 +1231,7 @@ impl App {
 
                 unsafe {
                     graphics_builder
-                        .draw_indexed_indirect(stream.indirect.clone())
+                        .draw_indexed_indirect(stream.indirect[idx].clone())
                         .unwrap();
                 }
             }
@@ -1248,7 +1249,7 @@ impl App {
             // Pass 2: MRT Lighting
             let descriptor_sets = vec![
                 rcx.context_descriptor_set
-                    .for_frame(rcx.current_frame)
+                    .for_frame(idx)
                     .clone(),
                 rcx.mrt_lighting.set.clone(),
             ];
@@ -1414,7 +1415,7 @@ impl App {
                 })
                 .unwrap();
             rcx.imgui_renderer
-                .upload(&mut graphics_builder, draw_data, rcx.current_frame);
+                .upload(&mut graphics_builder, draw_data, idx);
             unsafe {
                 graphics_builder.end_debug_utils_label().unwrap();
             }
@@ -1444,7 +1445,7 @@ impl App {
             rcx.imgui_renderer.draw(
                 &mut graphics_builder,
                 draw_data,
-                rcx.current_frame,
+                idx,
                 (&rcx.viewport, &rcx.scissor),
             );
 
@@ -1461,11 +1462,11 @@ impl App {
 
         let cmd_buf = graphics_builder.build().unwrap();
 
-        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
-        let future = rcx
-            .previous_frame_end
+        let previous = rcx.frame_futures[image_index as usize]
             .take()
-            .unwrap()
+            .unwrap_or_else(|| sync::now(self.device.clone()).boxed());
+
+        let future = previous
             .join(acquire_future)
             .then_execute(self.graphics_queue.clone(), cmd_buf)
             .unwrap()
@@ -1476,25 +1477,25 @@ impl App {
             .then_signal_fence_and_flush();
 
         match future.map_err(Validated::unwrap) {
-            Ok(f) => rcx.previous_frame_end = Some(f.boxed()),
+            Ok(f) => rcx.frame_futures[image_index as usize] = Some(f.boxed()),
             Err(VulkanError::OutOfDate) => {
                 rcx.recreate_swapchain = true;
-                rcx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                rcx.frame_futures[image_index as usize] =
+                    Some(sync::now(self.device.clone()).boxed());
             }
             Err(e) => {
                 eprintln!("present failed: {e}");
-                rcx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                rcx.frame_futures[image_index as usize] =
+                    Some(sync::now(self.device.clone()).boxed());
             }
         }
 
         self.input_state.end_frame();
-
-        rcx.current_frame = (rcx.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 }
 
 impl RenderContext {
-    fn build_frame(&mut self, allocator: Arc<StandardMemoryAllocator>) {
+    fn build_frame(&mut self, resource_index: usize, allocator: Arc<StandardMemoryAllocator>) {
         let submission = &self.frame_submission;
 
         let mut buckets: HashMap<MeshHandle, Vec<&DrawSubmission>> = HashMap::new();
@@ -1510,7 +1511,7 @@ impl RenderContext {
             if stream.transforms.len() < required {
                 let new_capacity = required.next_power_of_two().max(1);
 
-                stream.transforms = std::array::from_fn(|_| {
+                stream.transforms = (0..new_capacity).map(|_| {
                     Buffer::new_slice::<TransformTRS>(
                         allocator.clone(),
                         BufferCreateInfo {
@@ -1525,10 +1526,10 @@ impl RenderContext {
                         new_capacity as DeviceSize,
                     )
                     .unwrap()
-                });
+                }).collect();
             }
 
-            if let Ok(mut w) = stream.transforms[self.current_frame].write() {
+            if let Ok(mut w) = stream.transforms[resource_index].write() {
                 for (i, d) in draws.iter().enumerate() {
                     w[i] = d.transform;
                 }
@@ -1536,7 +1537,7 @@ impl RenderContext {
 
             stream.instance_count = required as u32;
 
-            if let Ok(mut cmds) = stream.indirect.write() {
+            if let Ok(mut cmds) = stream.indirect[resource_index].write() {
                 for cmd in cmds.iter_mut() {
                     cmd.first_instance = 0;
                     cmd.instance_count = stream.instance_count;

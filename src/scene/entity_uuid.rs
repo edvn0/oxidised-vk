@@ -1,6 +1,4 @@
 use super::serialisation::SerializableComponent;
-use legion::*;
-use std::collections::HashMap;
 use std::io::{Read, Result as IoResult, Write};
 use uuid::Uuid;
 
