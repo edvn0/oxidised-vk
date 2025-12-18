@@ -24,7 +24,7 @@ impl Camera {
 
             yaw: -90.0_f32.to_radians(),
             pitch: 0.0,
-            speed: 5.0,
+            speed: 5.0, // m/s
             fov_degrees: 70.0,
         };
         cam.update_basis();

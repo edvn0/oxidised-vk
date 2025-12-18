@@ -38,7 +38,6 @@ use vulkano::{
     shader::ShaderStages,
     sync::GpuFuture,
 };
-use vulkano::command_buffer::RecordingCommandBuffer;
 use vulkano::pipeline::DynamicState;
 use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
@@ -108,7 +107,7 @@ impl ImGuiRenderer {
             sampler_clamp.clone(),
         );
 
-        let frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|x| Self::empty_frame(allocator.clone()));
+        let frames: [FrameBuffers; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|_| Self::empty_frame(allocator.clone()));
 
         Self {
             allocator,

@@ -19,10 +19,6 @@ impl MeshRegistry {
         self.meshes.insert(name, mesh);
     }
 
-    pub fn remove(&mut self, name: &str) -> Option<Arc<MeshAsset>> {
-        self.meshes.remove(name)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<MeshAsset>)> {
         self.meshes.iter()
     }

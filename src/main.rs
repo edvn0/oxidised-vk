@@ -33,13 +33,11 @@ use std::default::Default;
 use std::sync::RwLock;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
-use glm::all;
 use vulkano::command_buffer::{
     ClearColorImageInfo, DrawIndexedIndirectCommand, PrimaryCommandBufferAbstract,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
-use vulkano::descriptor_set::pool::DescriptorPoolCreateFlags;
 use vulkano::device::DeviceOwned;
 use vulkano::format::{ClearColorValue, ClearValue, FormatFeatures};
 use vulkano::image::sampler::{
@@ -99,7 +97,6 @@ use vulkano::{
     },
     sync::{self, GpuFuture},
 };
-use vulkano::sync::fence::{Fence, FenceCreateFlags, FenceCreateInfo};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
 use winit::{
@@ -245,12 +242,6 @@ struct DrawSubmission {
     override_material: Option<u32>,
 }
 
-struct MeshDraw {
-    mesh: Arc<MeshAsset>,
-    first_instance: u32,
-    instance_count: u32,
-}
-
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 struct FrameSubmission {
@@ -285,7 +276,6 @@ struct RenderContext {
     mesh_streams: HashMap<Arc<MeshAsset>, MeshDrawStream>,
 
     white_image_sampler: Arc<ImageViewSampler>,
-    black_image_sampler: Arc<ImageViewSampler>,
 
     context_descriptor_set: FrameDescriptorSet,
 
@@ -595,13 +585,6 @@ impl ApplicationHandler for App {
             0xFF,
             default_sampler.clone(),
         );
-        let black_tex = create_image(
-            &self.graphics_queue,
-            &self.command_buffer_allocator,
-            &self.memory_allocator,
-            0x00,
-            default_sampler.clone(),
-        );
 
         let mesh_registry = load_meshes_from_directory(
             "assets/meshes",
@@ -813,7 +796,6 @@ impl ApplicationHandler for App {
                 &uniform_buffers[..MAX_FRAMES_IN_FLIGHT],
             ),
             white_image_sampler: white_tex,
-            black_image_sampler: black_tex,
             mrt_pass: mrt,
             mrt_lighting,
             composite,
@@ -1010,7 +992,6 @@ fn create_image(
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
-        let frame = rcx.current_frame;
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
             .size([300.0, 100.0], Condition::FirstUseEver)
@@ -1097,8 +1078,6 @@ impl App {
         if suboptimal {
             rcx.recreate_swapchain = true;
         }
-
-       // acquire_future.wait(None).unwrap();
 
         rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
