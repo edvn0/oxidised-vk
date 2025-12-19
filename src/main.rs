@@ -10,6 +10,8 @@ mod main_helpers;
 mod math;
 mod mesh;
 mod mesh_registry;
+mod render_context;
+mod render_passes;
 mod scene;
 mod shader_bindings;
 mod submission;
@@ -25,6 +27,10 @@ use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
+use crate::render_context::{
+    Culling, FrameResources, MeshDrawStream, RenderContext, TransformTRS, Winding,
+};
+use crate::render_passes::{Composite, MRT, MRTLighting, SwapchainPass};
 use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
@@ -121,68 +127,6 @@ fn main() -> Result<(), impl Error> {
     event_loop.run_app(&mut app)
 }
 
-struct MeshDrawStream {
-    mesh: Arc<MeshAsset>,
-    instance_count: u32,
-    material_ids: Subbuffer<[u32]>,
-    indirect: [Subbuffer<[DrawIndexedIndirectCommand]>; MAX_FRAMES_IN_FLIGHT],
-    transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum Culling {
-    None,
-    Back,
-    Front,
-    All,
-}
-
-impl Culling {
-    fn next(self) -> Self {
-        match self {
-            Self::None => Self::Back,
-            Self::Back => Self::Front,
-            Self::Front => Self::All,
-            Self::All => Self::None,
-        }
-    }
-}
-
-impl From<Culling> for CullMode {
-    fn from(value: Culling) -> Self {
-        match value {
-            Culling::None => CullMode::None,
-            Culling::Back => CullMode::Back,
-            Culling::Front => CullMode::Front,
-            Culling::All => CullMode::FrontAndBack,
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum Winding {
-    CounterClockwise,
-    Clockwise,
-}
-
-impl Winding {
-    fn toggle(self) -> Self {
-        match self {
-            Self::CounterClockwise => Self::Clockwise,
-            Self::Clockwise => Self::CounterClockwise,
-        }
-    }
-}
-
-impl From<Winding> for FrontFace {
-    fn from(value: Winding) -> Self {
-        match value {
-            Winding::Clockwise => FrontFace::Clockwise,
-            Winding::CounterClockwise => FrontFace::CounterClockwise,
-        }
-    }
-}
-
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
@@ -202,36 +146,6 @@ struct App {
     clockwise_front_face: Winding,
     lod_choice: usize,
 }
-struct MRT {
-    predepth_pipeline: Arc<GraphicsPipeline>,
-    gbuffer_image_views: [Arc<ImageView>; 3],
-    gbuffer_depth_view: Arc<ImageView>,
-    gbuffer_instanced_pipeline: Arc<GraphicsPipeline>,
-}
-
-struct SwapchainPass {
-    pipeline: Arc<GraphicsPipeline>,
-    set: Arc<DescriptorSet>,
-    attachment_image_views: Vec<Arc<ImageView>>,
-}
-
-struct MRTLighting {
-    pipeline: Arc<GraphicsPipeline>,
-    set: Arc<DescriptorSet>,
-    image_view: Arc<ImageView>,
-}
-
-struct Composite {
-    pipeline: Arc<GraphicsPipeline>,
-    set: Arc<DescriptorSet>,
-    image_view: Arc<ImageView>,
-}
-
-#[repr(C)]
-#[derive(BufferContents, Copy, Clone)]
-pub struct TransformTRS {
-    pub trs: [f32; 16],
-}
 
 #[repr(C)]
 #[derive(BufferContents, Clone, Copy)]
@@ -240,72 +154,6 @@ pub struct FrustumPlanes {
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
-
-struct FrameResources {
-    uniform_buffer: Subbuffer<RendererUBO>,
-}
-
-struct RenderContext {
-    window: Arc<Window>,
-    swapchain: Arc<Swapchain>,
-    viewport: Viewport,
-    scissor: Scissor,
-    recreate_swapchain: bool,
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
-    start_time: Instant,
-    elapsed_millis: u64,
-
-    meshes: Arc<RwLock<MeshRegistry>>,
-    mesh_streams: HashMap<MeshHandle, MeshDrawStream>,
-
-    white_image_sampler: Arc<ImageViewSampler>,
-
-    context_descriptor_set: FrameDescriptorSet,
-
-    frame_submission: FrameSubmission,
-    current_frame: usize,
-    frames: Vec<FrameResources>,
-
-    mrt_pass: MRT,
-    mrt_lighting: MRTLighting,
-    composite: Composite,
-    swapchain_pass: SwapchainPass,
-    bloom_pass: BloomPass,
-
-    winit_platform: WinitPlatform,
-    imgui_context: Context,
-    imgui_renderer: ImGuiRenderer,
-}
-
-impl RenderContext {
-    pub fn frame_index(&self) -> usize {
-        self.current_frame
-    }
-
-    pub fn update_camera_ubo(
-        &self,
-        camera: &Camera,
-        current_frame: usize,
-        window_size: PhysicalSize<u32>,
-    ) {
-        let aspect = window_size.width as f32 / window_size.height as f32;
-
-        let view = camera.view_matrix();
-        let proj = camera.projection_matrix(aspect);
-        let inverse_proj = proj.try_inverse().unwrap();
-
-        let sun = camera.sun_direction_view_space();
-
-        if let Ok(mut w) = self.frames[current_frame].uniform_buffer.write() {
-            *w = RendererUBO {
-                view: view.as_slice().try_into().unwrap(),
-                proj: proj.as_slice().try_into().unwrap(),
-                inverse_proj: inverse_proj.as_slice().try_into().unwrap(),
-                sun_direction: sun,
-            };
-        }
-    }
-}
 
 impl App {
     fn new(event_loop: &EventLoop<()>) -> Result<Self, Box<dyn Error>> {
@@ -660,13 +508,7 @@ impl ApplicationHandler for App {
 
             mesh_streams.insert(
                 handle,
-                MeshDrawStream {
-                    mesh: mesh.clone(),
-                    indirect,
-                    material_ids,
-                    transforms,
-                    instance_count: 0,
-                },
+                MeshDrawStream::new(mesh.clone(), material_ids, indirect, transforms),
             );
         }
 
@@ -782,9 +624,7 @@ impl ApplicationHandler for App {
         platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
 
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|i| FrameResources {
-                uniform_buffer: uniform_buffers[i].clone(),
-            })
+            .map(|i| FrameResources::new(&uniform_buffers[i]))
             .collect();
 
         window.set_visible(true);
@@ -822,11 +662,11 @@ impl ApplicationHandler for App {
         });
     }
 
-    /* fn exiting(&mut self, _: &ActiveEventLoop) {
+    fn exiting(&mut self, _: &ActiveEventLoop) {
         unsafe {
             self.device.wait_idle().unwrap();
         }
-    }*/
+    }
 
     fn window_event(
         &mut self,
@@ -1041,390 +881,48 @@ impl App {
 
         rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
 
-        {
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Predepth Z".to_string(),
-                    color: [0.1, 0.1, 0.9, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![],
-                    depth_attachment: Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: Some(ClearValue::Depth(0.0)),
-                        ..RenderingAttachmentInfo::image_view(
-                            rcx.mrt_pass.gbuffer_depth_view.clone(),
-                        )
-                    }),
-                    ..Default::default()
-                })
-                .unwrap()
-                .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
-                .unwrap()
-                .set_scissor(0, [rcx.scissor].into_iter().collect())
-                .unwrap()
-                .set_depth_compare_op(CompareOp::GreaterOrEqual)
-                .unwrap()
-                .set_depth_write_enable(true)
-                .unwrap()
-                .set_depth_test_enable(true)
-                .unwrap()
-                .set_cull_mode(self.cull_backfaces.into())
-                .unwrap()
-                .set_front_face(self.clockwise_front_face.into())
-                .unwrap()
-                .bind_pipeline_graphics(rcx.mrt_pass.predepth_pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    rcx.mrt_pass.predepth_pipeline.layout().clone(),
-                    0,
-                    [rcx.context_descriptor_set
-                        .for_frame(rcx.current_frame)
-                        .clone()]
-                    .to_vec(),
-                )
-                .unwrap();
-
-            let layout = rcx.mrt_pass.predepth_pipeline.layout().set_layouts()[1].clone();
-
-            for stream in rcx.mesh_streams.values() {
-                let set_1 = DescriptorSet::new(
-                    self.descriptor_set_allocator.clone(),
-                    layout.clone(),
-                    [WriteDescriptorSet::buffer(
-                        1,
-                        stream.transforms[rcx.frame_index()].clone(),
-                    )],
-                    [],
-                )
-                .unwrap();
-
-                graphics_builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        rcx.mrt_pass.predepth_pipeline.layout().clone(),
-                        1,
-                        [set_1].to_vec(),
-                    )
-                    .unwrap()
-                    .bind_vertex_buffers(0, stream.mesh.position_vertex_buffer.clone())
-                    .unwrap()
-                    .bind_index_buffer(stream.mesh.index_buffer.clone())
-                    .unwrap();
-
-                unsafe {
-                    graphics_builder
-                        .draw_indexed_indirect(stream.indirect[rcx.frame_index()].clone())
-                        .unwrap();
-                }
-            }
-
-            unsafe {
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
-        }
-
-        {
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Instanced MRT Geometry".to_string(),
-                    color: [0.99, 0.1, 0.1, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![
-                        Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.mrt_pass.gbuffer_image_views[0].clone(),
-                            )
-                        }),
-                        Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.mrt_pass.gbuffer_image_views[1].clone(),
-                            )
-                        }),
-                        Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.mrt_pass.gbuffer_image_views[2].clone(),
-                            )
-                        }),
-                    ],
-                    depth_attachment: Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Load,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: None,
-                        ..RenderingAttachmentInfo::image_view(
-                            rcx.mrt_pass.gbuffer_depth_view.clone(),
-                        )
-                    }),
-                    ..Default::default()
-                })
-                .unwrap()
-                .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
-                .unwrap()
-                .set_scissor(0, [rcx.scissor].into_iter().collect())
-                .unwrap()
-                .set_depth_compare_op(CompareOp::Equal)
-                .unwrap()
-                .set_depth_write_enable(true)
-                .unwrap()
-                .set_depth_test_enable(true)
-                .unwrap()
-                .set_cull_mode(self.cull_backfaces.into())
-                .unwrap()
-                .set_front_face(self.clockwise_front_face.into())
-                .unwrap()
-                .bind_pipeline_graphics(rcx.mrt_pass.gbuffer_instanced_pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
-                    0,
-                    [rcx.context_descriptor_set
-                        .for_frame(rcx.current_frame)
-                        .clone()]
-                    .to_vec(),
-                )
-                .unwrap();
-
-            let layout = rcx
-                .mrt_pass
-                .gbuffer_instanced_pipeline
-                .layout()
-                .set_layouts()[1]
-                .clone();
-
-            for stream in rcx.mesh_streams.values() {
-                let set_1 = DescriptorSet::new(
-                    self.descriptor_set_allocator.clone(),
-                    layout.clone(),
-                    [
-                        WriteDescriptorSet::image_view_sampler_array(
-                            0,
-                            0,
-                            stream
-                                .mesh
-                                .texture_array
-                                .iter()
-                                .cloned()
-                                .map(|v| (v.view.clone(), rcx.white_image_sampler.sampler.clone()))
-                                .chain(std::iter::repeat((
-                                    rcx.white_image_sampler.view.clone(),
-                                    rcx.white_image_sampler.sampler.clone(),
-                                )))
-                                .take(256),
-                        ),
-                        WriteDescriptorSet::buffer(1, stream.transforms[rcx.frame_index()].clone()),
-                        WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
-                        WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
-                    ],
-                    [],
-                )
-                .unwrap();
-
-                graphics_builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        rcx.mrt_pass.gbuffer_instanced_pipeline.layout().clone(),
-                        1,
-                        [set_1].to_vec(),
-                    )
-                    .unwrap()
-                    .bind_vertex_buffers(0, stream.mesh.vertex_buffer.clone())
-                    .unwrap()
-                    .bind_index_buffer(stream.mesh.index_buffer.clone())
-                    .unwrap();
-
-                unsafe {
-                    graphics_builder
-                        .draw_indexed_indirect(stream.indirect[rcx.frame_index()].clone())
-                        .unwrap();
-                }
-            }
-
-            unsafe {
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
-        }
-
-        {
-            // Pass 2: MRT Lighting
-            let descriptor_sets = vec![
-                rcx.context_descriptor_set
-                    .for_frame(rcx.current_frame)
-                    .clone(),
-                rcx.mrt_lighting.set.clone(),
-            ];
-
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "MRT Lighting".to_string(),
-                    color: [0.1, 0.99, 0.9, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                        ..RenderingAttachmentInfo::image_view(rcx.mrt_lighting.image_view.clone())
-                    })],
-                    ..Default::default()
-                })
-                .unwrap()
-                .bind_pipeline_graphics(rcx.mrt_lighting.pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    rcx.mrt_lighting.pipeline.layout().clone(),
-                    0,
-                    descriptor_sets,
-                )
-                .unwrap();
-
-            unsafe {
-                graphics_builder.draw(3, 1, 0, 0).unwrap();
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            };
-        }
-
-        {
-            // Pass 2.1: Bloom
-            rcx.bloom_pass.run(
+        rcx.mrt_pass
+            .record_predepth_pass(
                 &mut graphics_builder,
+                &rcx,
                 &self.descriptor_set_allocator,
-                rcx.mrt_lighting.image_view.clone(),
-                1.0, // bloom intensity
-                1.0, // threshold
-            );
-        }
+                &rcx.mesh_streams,
+                self.cull_backfaces,
+                self.clockwise_front_face,
+            )
+            .unwrap();
 
-        {
-            // Pass 3: Compositing, HDR -> HDR
-            let descriptor_sets = vec![rcx.composite.set.clone()];
+        rcx.mrt_pass
+            .record_gbuffer_pass(
+                &mut graphics_builder,
+                &rcx,
+                &self.descriptor_set_allocator,
+                &rcx.mesh_streams,
+                &rcx.white_image_sampler,
+                self.cull_backfaces,
+                self.clockwise_front_face,
+            )
+            .unwrap();
 
-            const PCS: [f32; 1] = [1.0];
+        rcx.mrt_lighting
+            .record_lighting_pass(&mut graphics_builder, &rcx)
+            .unwrap();
 
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Compositing".to_string(),
-                    color: [0.99, 0.99, 0.0, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                        ..RenderingAttachmentInfo::image_view(rcx.composite.image_view.clone())
-                    })],
-                    ..Default::default()
-                })
-                .unwrap()
-                .bind_pipeline_graphics(rcx.composite.pipeline.clone())
-                .unwrap()
-                .push_constants(rcx.composite.pipeline.layout().clone(), 0, PCS)
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    rcx.composite.pipeline.layout().clone(),
-                    0,
-                    descriptor_sets,
-                )
-                .unwrap();
+        rcx.bloom_pass.run(
+            &mut graphics_builder,
+            &self.descriptor_set_allocator,
+            rcx.mrt_lighting.image_view.clone(),
+            1.0, // bloom intensity
+            1.0, // threshold
+        );
 
-            unsafe {
-                graphics_builder.draw(3, 1, 0, 0).unwrap();
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            };
-        }
+        rcx.composite
+            .record_composite_pass(&mut graphics_builder, &rcx.scissor, 1.0)
+            .unwrap();
 
-        {
-            // Pass 4: Present, HDR -> LDR with tonemapping
-
-            let descriptor_sets = vec![rcx.swapchain_pass.set.clone()];
-
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Presentation".to_string(),
-                    color: [0.99, 0.0, 0.75, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: Some([0.0, 0.0, 0.0, 1.0].into()),
-                        ..RenderingAttachmentInfo::image_view(
-                            rcx.swapchain_pass.attachment_image_views[image_index as usize].clone(),
-                        )
-                    })],
-                    ..Default::default()
-                })
-                .unwrap()
-                .bind_pipeline_graphics(rcx.swapchain_pass.pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    rcx.swapchain_pass.pipeline.layout().clone(),
-                    0,
-                    descriptor_sets,
-                )
-                .unwrap();
-
-            unsafe {
-                graphics_builder.draw(3, 1, 0, 0).unwrap();
-
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
-        }
+        rcx.swapchain_pass
+            .record_present_pass(&mut graphics_builder, &rcx.scissor, image_index as usize)
+            .unwrap();
 
         {
             let draw_data = rcx.imgui_context.render();
@@ -1505,63 +1003,6 @@ impl App {
         self.input_state.end_frame();
 
         rcx.current_frame = (rcx.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
-    }
-}
-
-impl RenderContext {
-    fn build_frame(&mut self, allocator: Arc<StandardMemoryAllocator>) {
-        let submission = &self.frame_submission;
-
-        let mut buckets: HashMap<MeshHandle, Vec<&DrawSubmission>> = HashMap::new();
-        for draw in &submission.draws {
-            buckets.entry(draw.mesh).or_default().push(draw);
-        }
-
-        for (mesh_handle, draws) in buckets {
-            let stream = self.mesh_streams.get_mut(&mesh_handle).unwrap();
-
-            let required = draws.len();
-
-            let current = &stream.transforms[self.current_frame];
-            if current.len() < required as u64 {
-                let new_capacity = required
-                    .checked_next_power_of_two()
-                    .unwrap_or(required as usize)
-                    .max(1);
-
-                for slot in &mut stream.transforms {
-                    *slot = Buffer::new_slice::<TransformTRS>(
-                        allocator.clone(),
-                        BufferCreateInfo {
-                            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                            ..Default::default()
-                        },
-                        AllocationCreateInfo {
-                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                            ..Default::default()
-                        },
-                        new_capacity as DeviceSize,
-                    )
-                    .unwrap();
-                }
-            }
-
-            if let Ok(mut w) = stream.transforms[self.current_frame].write() {
-                for (i, d) in draws.iter().enumerate() {
-                    w[i] = d.transform;
-                }
-            }
-
-            stream.instance_count = required as u32;
-
-            if let Ok(mut cmds) = stream.indirect[self.current_frame].write() {
-                for cmd in cmds.iter_mut() {
-                    cmd.first_instance = 0;
-                    cmd.instance_count = stream.instance_count;
-                }
-            }
-        }
     }
 }
 
@@ -1825,17 +1266,17 @@ fn window_size_dependent_setup(
         .unwrap()
     };
 
-    let mrt = MRT {
+    let mrt = MRT::new(
         predepth_pipeline,
-        gbuffer_instanced_pipeline: mrt_instanced_pipeline,
-        gbuffer_depth_view: to_view(depth_image.clone()),
-        gbuffer_image_views: gbuffer_images
+        mrt_instanced_pipeline,
+        to_view(depth_image.clone()),
+        gbuffer_images
             .iter()
             .map(|img| to_view(img.clone()))
             .collect::<Vec<_>>()
             .try_into()
             .unwrap(),
-    };
+    );
 
     // Create MRT Lighting output image
     let mrt_lighting_image = Image::new(
@@ -1973,11 +1414,11 @@ fn window_size_dependent_setup(
         ci.dynamic_state.insert(DynamicState::DepthCompareOp);
         ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
 
-        MRTLighting {
-            pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
-            set: gb_set,
-            image_view: ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
-        }
+        MRTLighting::new(
+            GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
+            gb_set,
+            ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
+        )
     };
 
     // ==============================================================
@@ -2095,11 +1536,11 @@ fn window_size_dependent_setup(
         ci.dynamic_state.insert(DynamicState::DepthTestEnable);
         ci.dynamic_state.insert(DynamicState::DepthCompareOp);
         ci.dynamic_state.insert(DynamicState::DepthWriteEnable);
-        Composite {
-            pipeline: GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
+        Composite::new(
+            GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
             set,
-            image_view: ImageView::new_default(composite_image.clone()).unwrap(),
-        }
+            ImageView::new_default(composite_image.clone()).unwrap(),
+        )
     };
 
     // ==============================================================
@@ -2191,14 +1632,14 @@ fn window_size_dependent_setup(
         )
         .unwrap();
 
-        SwapchainPass {
+        SwapchainPass::new(
             pipeline,
             set,
-            attachment_image_views: swapchain_images
+            swapchain_images
                 .iter()
                 .map(|i| ImageView::new_default(i.clone()).unwrap())
                 .collect(),
-        }
+        )
     };
 
     // let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
