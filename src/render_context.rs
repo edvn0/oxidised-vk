@@ -28,7 +28,7 @@ use crate::{
     main_helpers::FrameDescriptorSet,
     mesh::{ImageViewSampler, MeshAsset},
     mesh_registry::{MeshHandle, MeshRegistry},
-    render_passes::*,
+    render_passes::recordings::{Composite, MRT, MRTLighting, SwapchainPass},
     shader_bindings::RendererUBO,
     submission::{DrawSubmission, FrameSubmission},
 };
@@ -163,10 +163,6 @@ pub struct RenderContext {
 }
 
 impl RenderContext {
-    pub fn frame_index(&self) -> usize {
-        self.current_frame
-    }
-
     pub fn update_camera_ubo(
         &self,
         camera: &Camera,

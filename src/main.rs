@@ -30,11 +30,12 @@ use crate::mesh_registry::{MeshHandle, MeshRegistry};
 use crate::render_context::{
     Culling, FrameResources, MeshDrawStream, RenderContext, TransformTRS, Winding,
 };
-use crate::render_passes::{
-    Composite, CompositePass, FrameContext, GBufferPass, ImGuiPass, MRT, MRTLighting,
-    MRTLightingPass, PreDepthPass, PresentPass, RenderPass, RenderRecorder, RenderResources,
-    SwapchainPass,
+use crate::render_passes::data::{FrameContext, RenderResources};
+use crate::render_passes::passes::{
+    CompositePass, GBufferPass, ImGuiPass, MRTLightingPass, PreDepthPass, PresentPass, RenderPass,
 };
+use crate::render_passes::recorder::RenderRecorder;
+use crate::render_passes::recordings::{Composite, MRT, MRTLighting, SwapchainPass};
 use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
@@ -915,7 +916,7 @@ impl App {
             &PreDepthPass { mrt: &rcx.mrt_pass },
             &GBufferPass { mrt: &rcx.mrt_pass },
             &MRTLightingPass {
-                mrt_lighting: &rcx.mrt_lighting,
+                lighting: &rcx.mrt_lighting,
             },
             &CompositePass {
                 composite: &rcx.composite,
