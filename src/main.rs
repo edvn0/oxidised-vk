@@ -21,7 +21,7 @@ mod vertex;
 use crate::bloom_pass::{BloomPass, BloomSettings, bloom_limits};
 use crate::camera::Camera;
 use crate::components::{MeshComponent, Transform, Visible};
-use crate::image::{ImageInfo, create_image};
+use crate::image::{ImageDimensions, ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
 use crate::main_helpers::FrameDescriptorSet;
@@ -136,6 +136,25 @@ fn main() -> Result<(), impl Error> {
     event_loop.run_app(&mut app)
 }
 
+#[derive(Clone)]
+pub struct GpuUploadContext {
+    pub queue: Arc<Queue>,
+    pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    pub memory_allocator: Arc<StandardMemoryAllocator>,
+}
+
+impl GpuUploadContext {
+    pub fn create_image(&self, value: &[u8], image_info: ImageInfo) -> Arc<ImageViewSampler> {
+        create_image(
+            self.queue.clone(),
+            self.command_buffer_allocator.clone(),
+            self.memory_allocator.clone(),
+            value,
+            image_info,
+        )
+    }
+}
+
 enum PostProcessPanel {
     Bloom,
     Composite,
@@ -149,6 +168,7 @@ struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
+    gpu_upload: GpuUploadContext,
     _compute_queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
@@ -309,10 +329,17 @@ impl App {
             Default::default(),
         ));
 
+        let gpu_upload = GpuUploadContext {
+            queue: graphics_queue.clone(),
+            command_buffer_allocator: command_buffer_allocator.clone(),
+            memory_allocator: memory_allocator.clone(),
+        };
+
         Ok(App {
             instance,
             device,
             graphics_queue,
+            gpu_upload,
             _compute_queue: compute_queue,
             memory_allocator,
             descriptor_set_allocator,
@@ -546,7 +573,7 @@ impl ApplicationHandler for App {
         let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
             window_size_dependent_setup(
                 &self.device,
-                &self.memory_allocator,
+                &self.gpu_upload,
                 &self.descriptor_set_allocator,
                 white_tex.clone(),
                 black_tex.clone(),
@@ -902,7 +929,7 @@ impl App {
             let (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass) =
                 window_size_dependent_setup(
                     &self.device,
-                    &self.memory_allocator,
+                    &self.gpu_upload,
                     &self.descriptor_set_allocator,
                     rcx.white_image_sampler.clone(),
                     rcx.black_image_sampler.clone(),
@@ -1033,7 +1060,7 @@ impl App {
 
 fn window_size_dependent_setup(
     device: &Arc<Device>,
-    memory_allocator: &Arc<GenericMemoryAllocator<FreeListAllocator>>,
+    upload: &GpuUploadContext,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     default_white_texture: Arc<ImageViewSampler>,
     default_black_texture: Arc<ImageViewSampler>,
@@ -1238,7 +1265,7 @@ fn window_size_dependent_setup(
     let gbuffer_images: Vec<Arc<Image>> = (0..3)
         .map(|_| {
             Image::new(
-                memory_allocator.clone(),
+                upload.memory_allocator.clone(),
                 ImageCreateInfo {
                     image_type: ImageType::Dim2d,
                     format: Format::R16G16B16A16_SFLOAT,
@@ -1253,7 +1280,7 @@ fn window_size_dependent_setup(
         .collect();
 
     let depth_image = Image::new(
-        memory_allocator.clone(),
+        upload.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format: Format::D24_UNORM_S8_UINT,
@@ -1306,7 +1333,7 @@ fn window_size_dependent_setup(
 
     // Create MRT Lighting output image
     let mrt_lighting_image = Image::new(
-        memory_allocator.clone(),
+        upload.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format: Format::R16G16B16A16_SFLOAT,
@@ -1450,14 +1477,19 @@ fn window_size_dependent_setup(
     // ==============================================================
     // === Bloom PASS (From HDR → another HDR)
     // ==============================================================
-    let bloom_pass =
-        BloomPass::new(device, memory_allocator, window_size[0], window_size[1]).unwrap();
+    let bloom_pass = BloomPass::new(
+        device.clone(),
+        upload.memory_allocator.clone(),
+        window_size[0],
+        window_size[1],
+    )
+    .unwrap();
 
     // ==============================================================
     // === COMPOSITE PASS (From HDR → another HDR)
     // ==============================================================
     let composite_image = Image::new(
-        memory_allocator.clone(),
+        upload.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format: Format::R16G16B16A16_SFLOAT,
@@ -1675,25 +1707,36 @@ fn window_size_dependent_setup(
         )
         .unwrap();
 
-        let lut = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim3d,
-                format: Format::R8G8B8A8_UNORM,
-                extent: [256, 256, 1],
-                mip_levels: 1,
-                array_layers: 1,
-                samples: SampleCount::Sample1,
-                tiling: ImageTiling::Optimal,
-                usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
-                initial_layout: ImageLayout::Undefined,
+        let lut_size: u32 = 32;
+
+        let value = generate_identity_lut_3d(lut_size);
+
+        let lut_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                unnormalized_coordinates: false,
                 ..Default::default()
             },
-            Default::default(),
         )
         .unwrap();
 
-        let grading_view = ImageView::new_default(lut.clone()).unwrap();
+        let image_info = ImageInfo {
+            dimensions: ImageDimensions::Dim3d([lut_size, lut_size, lut_size]),
+            format: Format::R8G8B8A8_UNORM,
+            mips: Some(1),
+            sampler: lut_sampler.clone(),
+            debug_name: "identity_lut_3d".to_string(),
+        };
+
+        let lut_texture = create_image(
+            upload.queue.clone(),
+            upload.command_buffer_allocator.clone(),
+            upload.memory_allocator.clone(),
+            &value,
+            image_info,
+        );
 
         let set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
@@ -1706,8 +1749,8 @@ fn window_size_dependent_setup(
                 ),
                 WriteDescriptorSet::image_view_sampler(
                     1,
-                    grading_view.clone(),
-                    default_white_texture.sampler.clone(),
+                    lut_texture.view.clone(),
+                    lut_texture.sampler.clone(),
                 ),
             ],
             [],
@@ -1738,4 +1781,27 @@ fn update_material_ids_for_mesh(mesh: &MeshAsset, material_ids: &mut [u32]) {
             draw_id += 1;
         }
     }
+}
+
+fn generate_identity_lut_3d(size: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((size * size * size * 4) as usize);
+
+    let max = (size - 1) as f32;
+
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                let rf = r as f32 / max;
+                let gf = g as f32 / max;
+                let bf = b as f32 / max;
+
+                data.push((rf * 255.0).round() as u8);
+                data.push((gf * 255.0).round() as u8);
+                data.push((bf * 255.0).round() as u8);
+                data.push(255);
+            }
+        }
+    }
+
+    data
 }

@@ -9,7 +9,9 @@ use vulkano::{
     device::{DeviceOwned, Queue},
     format::Format,
     image::{
-        Image, ImageCreateInfo, ImageUsage, max_mip_levels, sampler::Sampler, view::ImageView,
+        Image, ImageCreateInfo, ImageType, ImageUsage, max_mip_levels,
+        sampler::{LOD_CLAMP_NONE, Sampler},
+        view::{ImageView, ImageViewCreateInfo, ImageViewType},
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     sync::GpuFuture,
@@ -17,23 +19,33 @@ use vulkano::{
 
 use crate::mesh::ImageViewSampler;
 
+#[derive(Clone, Copy, Debug)]
+pub enum ImageDimensions {
+    Dim2d([u32; 2]),
+    Dim3d([u32; 3]),
+}
+
+#[derive(Clone)]
 pub struct ImageInfo {
-    dimensions: [u32; 2],
-    format: Format,
-    debug_name: String,
-    sampler: Arc<Sampler>,
+    pub dimensions: ImageDimensions,
+    pub format: Format,
+    pub mips: Option<u32>,
+    pub sampler: Arc<Sampler>,
+    pub debug_name: String,
 }
 
 impl ImageInfo {
     pub fn new(
-        dimensions: [u32; 2],
+        dimensions: ImageDimensions,
         format: Format,
+        mips: Option<u32>,
         debug_name: String,
         sampler: Arc<Sampler>,
     ) -> Self {
         Self {
             dimensions,
             format,
+            mips,
             debug_name,
             sampler,
         }
@@ -41,8 +53,9 @@ impl ImageInfo {
 
     pub fn white_texture(sampler: Arc<Sampler>) -> Self {
         Self::new(
-            [1, 1],
+            ImageDimensions::Dim2d([1, 1]),
             Format::R8G8B8A8_UNORM,
+            None,
             "White Texture".to_string(),
             sampler,
         )
@@ -50,8 +63,9 @@ impl ImageInfo {
 
     pub fn black_texture(sampler: Arc<Sampler>) -> Self {
         Self::new(
-            [1, 1],
+            ImageDimensions::Dim2d([1, 1]),
             Format::R8G8B8A8_UNORM,
+            None,
             "Black Texture".to_string(),
             sampler,
         )
@@ -72,8 +86,14 @@ pub fn create_image(
     value: &[u8],
     image_info: ImageInfo,
 ) -> Arc<ImageViewSampler> {
-    let expected_len = (image_info.dimensions[0] as usize)
-        * (image_info.dimensions[1] as usize)
+    let (extent, image_type) = match image_info.dimensions {
+        ImageDimensions::Dim2d([w, h]) => ([w, h, 1], ImageType::Dim2d),
+        ImageDimensions::Dim3d([w, h, d]) => ([w, h, d], ImageType::Dim3d),
+    };
+
+    let expected_len = (extent[0] as usize)
+        * (extent[1] as usize)
+        * (extent[2] as usize)
         * expected_bytes_per_pixel(image_info.format);
 
     debug_assert_eq!(
@@ -82,13 +102,17 @@ pub fn create_image(
         "Image data size does not match format requirements"
     );
 
-    let mip_count = max_mip_levels([image_info.dimensions[0], image_info.dimensions[1], 1]);
-
+    let mip_count = if let Some(val) = image_info.mips {
+        val.max(1)
+    } else {
+        max_mip_levels(extent)
+    };
     let img = Image::new(
         allocator.clone(),
         ImageCreateInfo {
+            image_type,
             format: image_info.format,
-            extent: [image_info.dimensions[0], image_info.dimensions[1], 1],
+            extent,
             mip_levels: mip_count,
             usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             ..Default::default()
@@ -103,7 +127,6 @@ pub fn create_image(
         .unwrap();
 
     {
-        // Perform a clear to the specified value
         let mut builder = AutoCommandBufferBuilder::primary(
             cb_allocator.clone(),
             queue.queue_family_index(),
@@ -135,7 +158,6 @@ pub fn create_image(
         };
 
         let result = ended.execute(queue.clone()).unwrap();
-
         result
             .then_signal_fence_and_flush()
             .unwrap()
@@ -143,8 +165,7 @@ pub fn create_image(
             .unwrap();
     }
 
-    Arc::new(ImageViewSampler::new(
-        ImageView::new_default(img.clone()).unwrap(),
-        image_info.sampler.clone(),
-    ))
+    let view = ImageView::new_default(img.clone()).unwrap();
+
+    Arc::new(ImageViewSampler::new(view, image_info.sampler.clone()))
 }

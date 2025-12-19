@@ -75,8 +75,8 @@ impl Default for BloomSettings {
 
 impl BloomPass {
     pub fn new(
-        device: &Arc<Device>,
-        allocator: &Arc<StandardMemoryAllocator>,
+        device: Arc<Device>,
+        allocator: Arc<StandardMemoryAllocator>,
         width: u32,
         height: u32,
     ) -> Result<Self, ()> {
@@ -95,7 +95,7 @@ impl BloomPass {
             h = (h / 2).max(1);
         }
 
-        let create_image = |allocator: &Arc<StandardMemoryAllocator>, w: u32, h: u32| {
+        let create_image = |allocator: Arc<StandardMemoryAllocator>, w: u32, h: u32| {
             let img = Image::new(
                 allocator.clone(),
                 ImageCreateInfo {
@@ -114,7 +114,7 @@ impl BloomPass {
         let mut mip_views: Vec<Arc<ImageView>> = Vec::with_capacity(mip_count);
         (0..mip_count).for_each(|i| {
             let (mw, mh) = mip_sizes[i];
-            mip_views.push(create_image(allocator, mw, mh));
+            mip_views.push(create_image(allocator.clone(), mw, mh));
         });
 
         // Linear sampler with clamp-to-edge for bilinear filtering
@@ -130,7 +130,7 @@ impl BloomPass {
         .unwrap();
 
         // Descriptor layout for extract (2 storage images)
-        let make_storage_layout = |device: &Arc<Device>, pc_size: u32| {
+        let make_storage_layout = |device: Arc<Device>, pc_size: u32| {
             let mut info = DescriptorSetLayoutCreateInfo::default();
             info.bindings.insert(0, {
                 let mut b =
@@ -169,7 +169,7 @@ impl BloomPass {
         };
 
         // Descriptor layout for downsample/upsample (sampler + sampled image + storage image)
-        let make_sampler_layout = |device: &Arc<Device>, pc_size: u32| {
+        let make_sampler_layout = |device: Arc<Device>, pc_size: u32| {
             let mut info = DescriptorSetLayoutCreateInfo::default();
             // binding 0: combined image sampler (src)
             info.bindings.insert(0, {
@@ -364,7 +364,7 @@ impl BloomPass {
 
         // Build extract stage
         let (extract_layout, extract_pipe_layout) =
-            make_storage_layout(device, std::mem::size_of::<f32>() as u32);
+            make_storage_layout(device.clone(), std::mem::size_of::<f32>() as u32);
         let extract_pipeline = ComputePipeline::new(
             device.clone(),
             None,
@@ -386,7 +386,7 @@ impl BloomPass {
 
         // Build downsample stage (vec2 push constant for src resolution)
         let (downsample_layout, downsample_pipe_layout) =
-            make_sampler_layout(device, std::mem::size_of::<[f32; 2]>() as u32);
+            make_sampler_layout(device.clone(), std::mem::size_of::<[f32; 2]>() as u32);
         let downsample_pipeline = ComputePipeline::new(
             device.clone(),
             None,
@@ -408,7 +408,7 @@ impl BloomPass {
 
         // Build upsample stage (filter_radius + intensity)
         let (upsample_layout, upsample_pipe_layout) =
-            make_sampler_layout(device, std::mem::size_of::<[f32; 2]>() as u32);
+            make_sampler_layout(device.clone(), std::mem::size_of::<[f32; 2]>() as u32);
         let upsample_pipeline = ComputePipeline::new(
             device.clone(),
             None,

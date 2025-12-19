@@ -1,10 +1,10 @@
 use crate::{
-    image::{ImageInfo, create_image},
+    image::{ImageDimensions, ImageInfo, create_image},
     imgui::shaders,
     mesh::ImageViewSampler,
 };
 
-use imgui::{DrawCmd, DrawData};
+use imgui::{DrawCmd, DrawData, FontConfig, FontSource};
 use std::{collections::BTreeMap, sync::Arc};
 
 use vulkano::{
@@ -141,12 +141,47 @@ impl ImGuiRenderer {
         queue: Arc<Queue>,
         cb_allocator: Arc<vulkano::command_buffer::allocator::StandardCommandBufferAllocator>,
     ) {
+        const ROBOTO_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Roboto-Regular.ttf");
+        const ROBOTO_BLACK: &[u8] = include_bytes!("../../assets/fonts/Roboto-Black.ttf");
+
+        let fonts = [
+            ("roboto_regular", ROBOTO_REGULAR),
+            ("roboto_black", ROBOTO_BLACK),
+        ];
+
+        let base_config = FontConfig {
+            oversample_h: 2,
+            oversample_v: 2,
+            pixel_snap_h: true,
+            rasterizer_multiply: 1.1,
+            glyph_offset: [0.0, 0.0],
+            ..Default::default()
+        };
+
+        let size_range = 8..=15;
+
+        let atlas = imgui.fonts();
+
+        for &(name, font_data) in &fonts {
+            for size in size_range.clone() {
+                atlas.add_font(&[FontSource::TtfData {
+                    data: font_data,
+                    size_pixels: size as f32,
+                    config: Some(FontConfig {
+                        name: Some(name.to_string()),
+                        ..base_config.clone()
+                    }),
+                }]);
+            }
+        }
+
         let fonts = imgui.fonts();
         let atlas = fonts.build_rgba32_texture();
 
         let image_info = ImageInfo::new(
-            [atlas.width as u32, atlas.height as u32],
+            ImageDimensions::Dim2d([atlas.width as u32, atlas.height as u32]),
             Format::R8G8B8A8_UNORM,
+            None,
             "ImGui Font Atlas".into(),
             self.sampler_clamp.clone(),
         );
