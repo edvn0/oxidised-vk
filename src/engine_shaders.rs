@@ -1,4 +1,3 @@
-
 pub(crate) mod predepth {
     pub mod vs {
         vulkano_shaders::shader! {
@@ -104,26 +103,30 @@ pub(crate) mod composite {
         vulkano_shaders::shader! {
             ty: "fragment",
             src: r"
-                        #version 450
+                #version 450
 
-                        layout(location = 0) in vec2 v_uvs;
-                        layout(location = 0) out vec4 out_color;
+                layout(location = 0) in vec2 v_uvs;
+                layout(location = 0) out vec4 out_color;
 
-                        layout(set=0, binding=0) uniform sampler2D hdr_tex;
-                        layout(set=0, binding=1) uniform sampler2D bloom_tex;
+                layout(set=0, binding=0) uniform sampler2D hdr_tex;
+                layout(set=0, binding=1) uniform sampler2D bloom_tex;
 
-                        layout (push_constant) uniform PC {
-                            float bloom_strength;
-                        };
+                layout(push_constant) uniform PC {
+                    float exposure;
+                    float bloom_strength;
+                } pc;
 
-                        void main() {
-                            vec3 hdr = texture(hdr_tex, v_uvs).rgb;
-                            vec3 bloom = texture(bloom_tex, v_uvs).rgb;
+                void main() {
+                    vec3 hdr   = texture(hdr_tex, v_uvs).rgb;
+                    vec3 bloom = texture(bloom_tex, v_uvs).rgb;
 
-                            float bloom_final_strength = max(bloom_strength, 1.0);
-                            out_color = vec4(hdr + bloom * bloom_final_strength, 1.0);
-                        }
-                    "
+                    vec3 color = hdr + bloom * pc.bloom_strength;
+
+                    color *= pc.exposure;
+
+                    out_color = vec4(color, 1.0);
+                }
+            ",
         }
     }
 }

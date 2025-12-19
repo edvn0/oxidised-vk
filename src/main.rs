@@ -18,7 +18,7 @@ mod submission;
 mod texture_cache;
 mod vertex;
 
-use crate::bloom_pass::BloomPass;
+use crate::bloom_pass::{BloomPass, BloomSettings, bloom_limits};
 use crate::camera::Camera;
 use crate::components::{MeshComponent, Transform, Visible};
 use crate::image::{ImageInfo, create_image};
@@ -32,10 +32,13 @@ use crate::render_context::{
 };
 use crate::render_passes::data::{FrameContext, RenderResources};
 use crate::render_passes::passes::{
-    CompositePass, GBufferPass, ImGuiPass, MRTLightingPass, PreDepthPass, PresentPass, RenderPass,
+    BloomEffectPass, CompositePass, GBufferPass, ImGuiPass, MRTLightingPass, PreDepthPass,
+    PresentPass, RenderPass,
 };
 use crate::render_passes::recorder::RenderRecorder;
-use crate::render_passes::recordings::{Composite, MRT, MRTLighting, SwapchainPass};
+use crate::render_passes::recordings::{
+    Composite, CompositeSettings, MRT, MRTLighting, SwapchainPass,
+};
 use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
@@ -132,6 +135,15 @@ fn main() -> Result<(), impl Error> {
     event_loop.run_app(&mut app)
 }
 
+enum PostProcessPanel {
+    Bloom,
+    Composite,
+}
+
+struct AppUIState {
+    post_process_panel: PostProcessPanel,
+}
+
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
@@ -141,6 +153,7 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     rcx: Option<RenderContext>,
+    ui_state: AppUIState,
 
     input_state: InputState,
     camera: Camera,
@@ -311,6 +324,9 @@ impl App {
             clockwise_front_face: Winding::CounterClockwise,
             lod_choice: 0,
             scene: Scene::new(),
+            ui_state: AppUIState {
+                post_process_panel: PostProcessPanel::Bloom,
+            },
         })
     }
 }
@@ -435,6 +451,15 @@ impl ApplicationHandler for App {
             &white_as_u8_slice,
             image_info,
         );
+        let black_as_u8_slice = [0x00, 0x00, 0x00, 0x00];
+        let black_image_info = ImageInfo::black_texture(default_sampler.clone());
+        let black_tex = create_image(
+            self.graphics_queue.clone(),
+            self.command_buffer_allocator.clone(),
+            self.memory_allocator.clone(),
+            &black_as_u8_slice,
+            black_image_info,
+        );
 
         let mesh_registry = load_meshes_from_directory(
             "assets/meshes",
@@ -523,6 +548,7 @@ impl ApplicationHandler for App {
                 &self.memory_allocator,
                 &self.descriptor_set_allocator,
                 white_tex.clone(),
+                black_tex.clone(),
                 &swapchain_images,
             );
 
@@ -650,10 +676,13 @@ impl ApplicationHandler for App {
                 &uniform_buffers[..MAX_FRAMES_IN_FLIGHT],
             ),
             white_image_sampler: white_tex,
+            black_image_sampler: black_tex,
             mrt_pass: mrt,
             mrt_lighting,
             composite,
+            composite_settings: CompositeSettings::default(),
             bloom_pass,
+            bloom_settings: BloomSettings::default(),
 
             frame_submission: FrameSubmission { draws: vec![] },
             meshes: mesh_registry,
@@ -802,6 +831,32 @@ impl App {
                 ));
             });
 
+        ui.window("Post Processing").build(|| {
+            let preview = match self.ui_state.post_process_panel {
+                PostProcessPanel::Bloom => "Bloom",
+                PostProcessPanel::Composite => "Composite",
+            };
+
+            if let Some(_cb) = ui.begin_combo("Effect", preview) {
+                if ui.selectable("Bloom") {
+                    self.ui_state.post_process_panel = PostProcessPanel::Bloom;
+                }
+                if ui.selectable("Composite") {
+                    self.ui_state.post_process_panel = PostProcessPanel::Composite;
+                }
+            }
+
+            ui.separator();
+
+            match self.ui_state.post_process_panel {
+                PostProcessPanel::Bloom => {
+                    rcx.bloom_settings.ui(ui);
+                }
+                PostProcessPanel::Composite => {
+                    rcx.composite_settings.ui(ui);
+                }
+            }
+        });
         rcx.winit_platform.prepare_render(ui, &rcx.window);
 
         rcx.frame_submission.clear_all();
@@ -849,6 +904,7 @@ impl App {
                     &self.memory_allocator,
                     &self.descriptor_set_allocator,
                     rcx.white_image_sampler.clone(),
+                    rcx.black_image_sampler.clone(),
                     &new_swapchain_images,
                 );
             rcx.swapchain_pass = swapchain_pass;
@@ -918,9 +974,15 @@ impl App {
             &MRTLightingPass {
                 lighting: &rcx.mrt_lighting,
             },
+            &BloomEffectPass {
+                bloom: &rcx.bloom_pass,
+                settings: &rcx.bloom_settings,
+                input_image: &rcx.mrt_lighting.image_view,
+            },
             &CompositePass {
                 composite: &rcx.composite,
-                exposure: 1.0,
+                bloom_enabled: rcx.bloom_settings.enabled,
+                settings: &rcx.composite_settings,
             },
             &PresentPass {
                 swapchain: &rcx.swapchain_pass,
@@ -973,6 +1035,7 @@ fn window_size_dependent_setup(
     memory_allocator: &Arc<GenericMemoryAllocator<FreeListAllocator>>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     default_white_texture: Arc<ImageViewSampler>,
+    default_black_texture: Arc<ImageViewSampler>,
     swapchain_images: &[Arc<Image>],
 ) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
     let predepth_pipeline = {
@@ -1455,6 +1518,26 @@ fn window_size_dependent_setup(
             [],
         )
         .unwrap();
+
+        let disabled_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            set_layout.clone(),
+            [
+                WriteDescriptorSet::image_view_sampler(
+                    0,
+                    ImageView::new_default(mrt_lighting_image.clone()).unwrap(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    default_black_texture.view.clone(),
+                    default_black_texture.sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .unwrap();
+
         let layout = PipelineLayout::new(
             device.clone(),
             PipelineLayoutCreateInfo {
@@ -1501,6 +1584,7 @@ fn window_size_dependent_setup(
         Composite::new(
             GraphicsPipeline::new(device.clone(), None, ci).unwrap(),
             set,
+            disabled_set,
             ImageView::new_default(composite_image.clone()).unwrap(),
         )
     };

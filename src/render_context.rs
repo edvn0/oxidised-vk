@@ -22,13 +22,13 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     MAX_FRAMES_IN_FLIGHT,
-    bloom_pass::BloomPass,
+    bloom_pass::{BloomPass, BloomSettings},
     camera::Camera,
     imgui::renderer::ImGuiRenderer,
     main_helpers::FrameDescriptorSet,
     mesh::{ImageViewSampler, MeshAsset},
     mesh_registry::{MeshHandle, MeshRegistry},
-    render_passes::recordings::{Composite, MRT, MRTLighting, SwapchainPass},
+    render_passes::recordings::{Composite, CompositeSettings, MRT, MRTLighting, SwapchainPass},
     shader_bindings::RendererUBO,
     submission::{DrawSubmission, FrameSubmission},
 };
@@ -144,6 +144,7 @@ pub struct RenderContext {
     pub mesh_streams: HashMap<MeshHandle, MeshDrawStream>,
 
     pub white_image_sampler: Arc<ImageViewSampler>,
+    pub black_image_sampler: Arc<ImageViewSampler>,
 
     pub context_descriptor_set: FrameDescriptorSet,
 
@@ -153,9 +154,14 @@ pub struct RenderContext {
 
     pub mrt_pass: MRT,
     pub mrt_lighting: MRTLighting,
+
     pub composite: Composite,
+    pub composite_settings: CompositeSettings,
+
     pub swapchain_pass: SwapchainPass,
+
     pub bloom_pass: BloomPass,
+    pub bloom_settings: BloomSettings,
 
     pub winit_platform: WinitPlatform,
     pub imgui_context: Context,

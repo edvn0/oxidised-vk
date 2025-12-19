@@ -47,6 +47,15 @@ impl ImageInfo {
             sampler,
         )
     }
+
+    pub fn black_texture(sampler: Arc<Sampler>) -> Self {
+        Self::new(
+            [1, 1],
+            Format::R8G8B8A8_UNORM,
+            "Black Texture".to_string(),
+            sampler,
+        )
+    }
 }
 
 fn expected_bytes_per_pixel(format: Format) -> usize {

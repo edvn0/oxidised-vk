@@ -41,6 +41,38 @@ fn compute_mip_count(width: u32, height: u32) -> usize {
     mips.max(1)
 }
 
+pub mod bloom_limits {
+    pub const THRESHOLD_MIN: f32 = 0.0;
+    pub const THRESHOLD_MAX: f32 = 5.0;
+    pub const THRESHOLD_DEFAULT: f32 = 1.0;
+
+    pub const INTENSITY_MIN: f32 = 0.0;
+    pub const INTENSITY_MAX: f32 = 3.0;
+    pub const INTENSITY_DEFAULT: f32 = 1.0;
+
+    pub const FILTER_RADIUS_MIN: f32 = 0.0005;
+    pub const FILTER_RADIUS_MAX: f32 = 0.02;
+    pub const FILTER_RADIUS_DEFAULT: f32 = 0.005;
+}
+
+pub struct BloomSettings {
+    pub threshold: f32,
+    pub intensity: f32,
+    pub filter_radius: f32,
+    pub enabled: bool,
+}
+
+impl Default for BloomSettings {
+    fn default() -> Self {
+        Self {
+            threshold: bloom_limits::THRESHOLD_DEFAULT,
+            intensity: bloom_limits::INTENSITY_DEFAULT,
+            filter_radius: bloom_limits::FILTER_RADIUS_DEFAULT,
+            enabled: true,
+        }
+    }
+}
+
 impl BloomPass {
     pub fn new(
         device: &Arc<Device>,
@@ -412,10 +444,22 @@ impl BloomPass {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         descriptor_allocator: &Arc<StandardDescriptorSetAllocator>,
         hdr_input: Arc<ImageView>,
-        intensity: f32,
-        threshold: f32,
+        settings: &BloomSettings,
     ) {
         let (w0, h0) = self.mip_sizes[0];
+
+        let threshold = settings
+            .threshold
+            .clamp(bloom_limits::THRESHOLD_MIN, bloom_limits::THRESHOLD_MAX);
+
+        let intensity = settings
+            .intensity
+            .clamp(bloom_limits::INTENSITY_MIN, bloom_limits::INTENSITY_MAX);
+
+        let filter_radius = settings.filter_radius.clamp(
+            bloom_limits::FILTER_RADIUS_MIN,
+            bloom_limits::FILTER_RADIUS_MAX,
+        );
 
         builder
             .begin_debug_utils_label(DebugUtilsLabel {
@@ -517,9 +561,6 @@ impl BloomPass {
         }
 
         // ===== UPSAMPLE CHAIN =====
-        // Progressive upsample: smallest -> largest, accumulating
-        let filter_radius = 0.005; // In texture coordinates
-
         for mip in (1..self.mip_count).rev() {
             let (dst_w, dst_h) = self.mip_sizes[mip - 1];
 

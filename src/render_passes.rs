@@ -97,10 +97,13 @@ pub mod recorder {
 }
 
 pub mod passes {
-    use crate::render_passes::{
-        data::{FrameContext, RenderPassResult, RenderResources},
-        recorder::*,
-        recordings::{Composite, MRT, MRTLighting, SwapchainPass},
+    use crate::{
+        bloom_pass::{BloomPass, BloomSettings},
+        render_passes::{
+            data::{FrameContext, RenderPassResult, RenderResources},
+            recorder::*,
+            recordings::{Composite, CompositeSettings, MRT, MRTLighting, SwapchainPass},
+        },
     };
 
     use super::*;
@@ -184,9 +187,38 @@ pub mod passes {
         }
     }
 
+    pub struct BloomEffectPass<'a> {
+        pub bloom: &'a BloomPass,
+        pub settings: &'a BloomSettings,
+        pub input_image: &'a Arc<ImageView>,
+    }
+
+    impl<'a> RenderPass for BloomEffectPass<'a> {
+        fn record(
+            &self,
+            recorder: &mut RenderRecorder,
+            _frame: &FrameContext,
+            res: &RenderResources,
+        ) -> RenderPassResult<()> {
+            if !self.settings.enabled {
+                return Ok(());
+            }
+
+            self.bloom.run(
+                recorder.cmd,
+                res.descriptor_sets,
+                self.input_image.clone(),
+                self.settings,
+            );
+
+            Ok(())
+        }
+    }
+
     pub struct CompositePass<'a> {
         pub composite: &'a Composite,
-        pub exposure: f32,
+        pub bloom_enabled: bool,
+        pub settings: &'a CompositeSettings,
     }
 
     impl<'a> RenderPass for CompositePass<'a> {
@@ -196,8 +228,12 @@ pub mod passes {
             frame: &FrameContext,
             _res: &RenderResources,
         ) -> RenderPassResult<()> {
-            self.composite
-                .record_composite_pass(recorder.cmd, frame.scissor, self.exposure)
+            self.composite.record_composite_pass(
+                recorder.cmd,
+                frame.scissor,
+                self.bloom_enabled,
+                self.settings,
+            )
         }
     }
 
@@ -268,7 +304,11 @@ pub mod passes {
 pub mod recordings {
     use derive_more::Constructor;
 
-    use crate::render_passes::data::{RenderPassError, RenderPassResult};
+    use crate::{
+        engine_shaders,
+        imgui::settings,
+        render_passes::data::{RenderPassError, RenderPassResult},
+    };
 
     use super::*;
 
@@ -289,10 +329,25 @@ pub mod recordings {
         pub image_view: Arc<ImageView>,
     }
 
+    pub struct CompositeSettings {
+        pub exposure: f32,
+        pub bloom_strength: f32,
+    }
+
+    impl Default for CompositeSettings {
+        fn default() -> Self {
+            Self {
+                exposure: 1.0,
+                bloom_strength: 1.0,
+            }
+        }
+    }
+
     #[derive(Constructor)]
     pub struct Composite {
         pub pipeline: Arc<GraphicsPipeline>,
         pub set: Arc<DescriptorSet>,
+        pub disabled_set: Arc<DescriptorSet>,
         pub image_view: Arc<ImageView>,
     }
 
@@ -544,8 +599,20 @@ pub mod recordings {
             &self,
             builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
             scissor: &Scissor,
-            exposure: f32,
+            bloom_enabled: bool,
+            settings: &CompositeSettings,
         ) -> RenderPassResult<()> {
+            let set = if bloom_enabled {
+                &self.set
+            } else {
+                &self.disabled_set
+            };
+
+            let pc = engine_shaders::composite::fs::PC {
+                exposure: settings.exposure,
+                bloom_strength: settings.bloom_strength,
+            };
+
             builder
                 .begin_debug_utils_label(DebugUtilsLabel {
                     label_name: "Composite".into(),
@@ -564,12 +631,12 @@ pub mod recordings {
                     ..Default::default()
                 })?
                 .bind_pipeline_graphics(self.pipeline.clone())?
-                .push_constants(self.pipeline.layout().clone(), 0, [exposure])?
+                .push_constants(self.pipeline.layout().clone(), 0, pc)?
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     self.pipeline.layout().clone(),
                     0,
-                    vec![self.set.clone()],
+                    vec![set.clone()],
                 )?;
 
             unsafe {
