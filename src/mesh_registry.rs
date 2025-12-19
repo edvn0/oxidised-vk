@@ -1,6 +1,6 @@
+use crate::mesh::MeshAsset;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::mesh::MeshAsset;
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]

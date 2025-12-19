@@ -62,13 +62,14 @@ use vulkano::image::sampler::{
     SamplerMipmapMode,
 };
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{ImageAspects, ImageSubresourceRange};
+use vulkano::image::{ImageAspects, ImageLayout, ImageSubresourceRange, ImageTiling, SampleCount};
 use vulkano::instance::InstanceExtensions;
 use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexInputState};
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
+use vulkano::sync::SharingMode;
 use vulkano::{
     DeviceSize, Validated, Version, VulkanError, VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -1321,11 +1322,11 @@ fn window_size_dependent_setup(
     // === MRT LIGHTING PASS (UBO + GBUFFER INPUT)
     // ==============================================================
     let mrt_lighting = {
-        let vs = engine_shaders::mrt_light::vs::load(device.clone())
+        let vs = engine_shaders::fullscreen_vertex_shader::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = engine_shaders::mrt_light::fs::load(device.clone())
+        let fs = engine_shaders::mrt_light::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -1469,11 +1470,11 @@ fn window_size_dependent_setup(
     .unwrap();
 
     let composite = {
-        let vs = engine_shaders::composite::vs::load(device.clone())
+        let vs = engine_shaders::fullscreen_vertex_shader::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = engine_shaders::composite::fs::load(device.clone())
+        let fs = engine_shaders::composite::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
@@ -1545,7 +1546,7 @@ fn window_size_dependent_setup(
                 push_constant_ranges: [PushConstantRange {
                     stages: ShaderStages::FRAGMENT,
                     offset: 0,
-                    size: std::mem::size_of::<engine_shaders::composite::fs::PC>() as _,
+                    size: std::mem::size_of::<engine_shaders::composite::PC>() as _,
                 }]
                 .to_vec(),
                 ..Default::default()
@@ -1593,17 +1594,22 @@ fn window_size_dependent_setup(
     // === SWAPCHAIN PASS (unchanged)
     // ==============================================================
     let swapchain_pass = {
-        let vs = engine_shaders::fullscreen::vs::load(device.clone())
+        let vs = engine_shaders::fullscreen_vertex_shader::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let fs = engine_shaders::fullscreen::fs::load(device.clone())
+        let fs = engine_shaders::fullscreen::load(device.clone())
             .unwrap()
             .entry_point("main")
             .unwrap();
 
         let mut composite_image = DescriptorSetLayoutCreateInfo::default();
         composite_image.bindings.insert(0, {
+            let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+            bind.stages = ShaderStages::FRAGMENT;
+            bind
+        });
+        composite_image.bindings.insert(1, {
             let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
             bind.stages = ShaderStages::FRAGMENT;
             bind
@@ -1653,27 +1659,57 @@ fn window_size_dependent_setup(
 
         let pipeline = GraphicsPipeline::new(device.clone(), None, ci).unwrap();
 
-        let mut bind = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
-        bind.stages = ShaderStages::FRAGMENT;
+        let mut bind_0 = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+        bind_0.stages = ShaderStages::FRAGMENT;
+
+        let mut bind_1 = DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+        bind_1.stages = ShaderStages::FRAGMENT;
 
         let descriptor_layout = DescriptorSetLayout::new(
             device.clone(),
             DescriptorSetLayoutCreateInfo {
                 flags: Default::default(),
-                bindings: BTreeMap::from([(0, bind)]),
+                bindings: BTreeMap::from([(0, bind_0), (1, bind_1)]),
                 ..Default::default()
             },
         )
         .unwrap();
 
+        let lut = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim3d,
+                format: Format::R8G8B8A8_UNORM,
+                extent: [256, 256, 1],
+                mip_levels: 1,
+                array_layers: 1,
+                samples: SampleCount::Sample1,
+                tiling: ImageTiling::Optimal,
+                usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                initial_layout: ImageLayout::Undefined,
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .unwrap();
+
+        let grading_view = ImageView::new_default(lut.clone()).unwrap();
+
         let set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
             descriptor_layout.clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                composite.image_view.clone(),
-                default_white_texture.sampler.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view_sampler(
+                    0,
+                    composite.image_view.clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    grading_view.clone(),
+                    default_white_texture.sampler.clone(),
+                ),
+            ],
             [],
         )
         .unwrap();

@@ -1,3 +1,4 @@
+use crate::mesh_registry::MeshRegistry;
 use crate::texture_cache::{BindlessTextureIndex, TextureCache};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use meshopt_rs::vertex::Position;
@@ -9,6 +10,10 @@ use meshopt_rs::{
 use nalgebra::{Matrix4, Vector3, Vector4};
 use std::fs;
 use std::sync::{Arc, RwLock};
+use vulkano::command_buffer::{BlitImageInfo, ImageBlit};
+use vulkano::device::DeviceOwned;
+use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
+use vulkano::image::{ImageAspects, ImageSubresourceLayers};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -21,11 +26,6 @@ use vulkano::{
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     sync::GpuFuture,
 };
-use vulkano::command_buffer::{BlitImageInfo, ImageBlit};
-use vulkano::device::DeviceOwned;
-use vulkano::image::{ImageAspects, ImageSubresourceLayers};
-use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
-use crate::mesh_registry::MeshRegistry;
 
 #[derive(Debug)]
 pub enum MeshLoadError {
@@ -75,9 +75,8 @@ pub(crate) struct ImageViewSampler {
 }
 
 impl ImageViewSampler {
-    pub fn new(   view: Arc<ImageView>,
-                  sampler: Arc<Sampler>)  -> Self {
-        Self {view,sampler}
+    pub fn new(view: Arc<ImageView>, sampler: Arc<Sampler>) -> Self {
+        Self { view, sampler }
     }
 }
 
@@ -426,15 +425,13 @@ fn upload_gltf_image(
             extent: [img.width, img.height, 1],
             mip_levels,
             format,
-            usage: ImageUsage::TRANSFER_DST
-                | ImageUsage::TRANSFER_SRC
-                | ImageUsage::SAMPLED,
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
             initial_layout: ImageLayout::Undefined,
             ..Default::default()
         },
         AllocationCreateInfo::default(),
     )
-        .unwrap();
+    .unwrap();
 
     let mut cb = AutoCommandBufferBuilder::primary(
         cb_allocator.clone(),
@@ -442,7 +439,11 @@ fn upload_gltf_image(
         CommandBufferUsage::OneTimeSubmit,
     )
     .unwrap();
-    cb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging.clone(), image.clone())).unwrap();
+    cb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+        staging.clone(),
+        image.clone(),
+    ))
+    .unwrap();
 
     /* === Generate mip chain === */
     let mut width = img.width as i32;
@@ -464,15 +465,11 @@ fn upload_gltf_image(
                 },
                 dst_offsets: [
                     [0, 0, 0],
-                    [
-                        (width / 2).max(1) as u32,
-                        (height / 2).max(1) as u32,
-                        1,
-                    ],
+                    [(width / 2).max(1) as u32, (height / 2).max(1) as u32, 1],
                 ],
                 ..Default::default()
             }]
-                .into(),
+            .into(),
             filter: Filter::Linear,
             ..BlitImageInfo::images(image.clone(), image.clone())
         })
@@ -491,9 +488,19 @@ fn upload_gltf_image(
         .wait(None)
         .unwrap();
 
-    let sampler = Sampler::new(allocator.device().clone(), SamplerCreateInfo{ lod: 0.0..=(mip_levels as f32), ..SamplerCreateInfo::default() }).unwrap();
+    let sampler = Sampler::new(
+        allocator.device().clone(),
+        SamplerCreateInfo {
+            lod: 0.0..=(mip_levels as f32),
+            ..SamplerCreateInfo::default()
+        },
+    )
+    .unwrap();
 
-    Ok(Arc::new(ImageViewSampler::new(ImageView::new_default(image).unwrap(), sampler)))
+    Ok(Arc::new(ImageViewSampler::new(
+        ImageView::new_default(image).unwrap(),
+        sampler,
+    )))
 }
 
 pub fn generate_lods_meshopt(
@@ -538,16 +545,11 @@ pub fn load_meshes_from_directory(
     graphics_queue: &Arc<Queue>,
     white_tex: Arc<ImageViewSampler>,
 ) -> Arc<RwLock<MeshRegistry>> {
-
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
-
+    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().filter_map(Result::ok).collect();
 
     let registry = Arc::new(RwLock::new(MeshRegistry::new()));
-    if let Ok(mut write_guard) =registry.write() {
-    entries.sort_by_key(|e| e.path());
+    if let Ok(mut write_guard) = registry.write() {
+        entries.sort_by_key(|e| e.path());
         for entry in entries {
             let path = entry.path();
 
@@ -575,7 +577,7 @@ pub fn load_meshes_from_directory(
                 graphics_queue,
                 white_tex.clone(),
             )
-                .unwrap();
+            .unwrap();
 
             let mesh = upload_build_mesh(build, images, allocator).unwrap();
 

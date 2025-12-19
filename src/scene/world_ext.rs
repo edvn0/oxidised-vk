@@ -1,5 +1,5 @@
-use legion::*;
 use super::entity_uuid::EntityUuid;
+use legion::*;
 
 pub trait WorldExt {
     fn push_with_uuid<T>(&mut self, components: T) -> (Entity, EntityUuid)

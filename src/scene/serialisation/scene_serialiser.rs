@@ -1,10 +1,10 @@
 use legion::*;
-use std::io::{Read, Write, Result as IoResult};
+use std::io::{Read, Result as IoResult, Write};
 
 use super::component_registry::ComponentRegistry;
 use super::component_serialiser::SerializableComponent;
-use crate::scene::entity_uuid::EntityUuid;
 use crate::scene::WorldExt;
+use crate::scene::entity_uuid::EntityUuid;
 
 pub struct SceneSerialiser {
     registry: ComponentRegistry,

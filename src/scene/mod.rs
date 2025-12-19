@@ -2,15 +2,15 @@ pub mod entity_uuid;
 pub mod serialisation;
 pub mod world_ext;
 
-use legion::*;
 use crate::components::{MaterialOverride, MeshComponent, Transform, Visible};
 use crate::scene::serialisation::scene_serialiser::SceneSerialiser;
+use legion::*;
 use std::io::Result as IoResult;
 use std::path::Path;
 
-pub use world_ext::WorldExt;
 use crate::scene::entity_uuid::EntityUuid;
 use crate::submission::{DrawSubmission, FrameSubmission};
+pub use world_ext::WorldExt;
 
 pub struct Scene {
     world: World,
@@ -29,10 +29,9 @@ impl Scene {
             .flush()
             .build();
 
-            let mut resources = Resources::default();
+        let mut resources = Resources::default();
         resources.insert(FrameSubmission { draws: vec![] });
 
-        
         Self {
             world,
             resources,
@@ -50,11 +49,11 @@ impl Scene {
     pub fn resources_mut(&mut self) -> &mut Resources {
         &mut self.resources
     }
-    
+
     pub fn update(&mut self) {
         self.schedule.execute(&mut self.world, &mut self.resources);
     }
-    
+
     /// Create a serialiser with all registered component types
     pub fn create_serialiser() -> SceneSerialiser {
         let mut serialiser = SceneSerialiser::new();
@@ -66,20 +65,20 @@ impl Scene {
             .register::<MaterialOverride>();
         serialiser
     }
-    
+
     /// Save the scene to a file
     pub fn save_to_file(&self, path: &Path) -> IoResult<()> {
         let serialiser = Self::create_serialiser();
         let mut file = std::fs::File::create(path)?;
         serialiser.serialize_world(&self.world, &mut file)
     }
-    
+
     /// Load a scene from a file
     pub fn load_from_file(path: &Path) -> IoResult<Self> {
         let serialiser = Self::create_serialiser();
         let mut file = std::fs::File::open(path)?;
         let world = serialiser.deserialize_world(&mut file)?;
-        
+
         Ok(Self::from_world(world))
     }
 }
@@ -87,7 +86,7 @@ impl Scene {
 #[system(for_each)]
 fn collect_draws(
     _uuid: Option<&EntityUuid>,
-        transform: &Transform,
+    transform: &Transform,
     mesh: &MeshComponent,
     material: Option<&MaterialOverride>,
     _: &Visible,

@@ -608,7 +608,7 @@ pub mod recordings {
                 &self.disabled_set
             };
 
-            let pc = engine_shaders::composite::fs::PC {
+            let pc = engine_shaders::composite::PC {
                 exposure: settings.exposure,
                 bloom_strength: settings.bloom_strength,
             };
