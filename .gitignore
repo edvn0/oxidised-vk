@@ -2,3 +2,5 @@
 .idea
 imgui.ini
 *.scene
+# For now, lets just regenerate
+assets/engine/*.rgba

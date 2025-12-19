@@ -102,6 +102,8 @@ use vulkano::{
 };
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
+use winit::platform::windows::WindowExtWindows;
+use winit::window::Icon;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -110,7 +112,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const INSTANCE_COUNT: DeviceSize = 20000;
+const INSTANCE_COUNT: DeviceSize = 500;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -490,9 +492,24 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut attribs = Window::default_attributes();
-        attribs.inner_size = Some(PhysicalSize::new(1280, 1024).into());
+        let mut attribs = Window::default_attributes().with_visible(false);
+        attribs.inner_size = Some(PhysicalSize::new(2300, 1024).into());
         let window = Arc::new(event_loop.create_window(attribs).unwrap());
+        const ICON_256: &[u8] = include_bytes!("../assets/engine/icon_256.rgba");
+        const ICON_32: &[u8] = include_bytes!("../assets/engine/icon_32.rgba");
+        debug_assert_eq!(ICON_256.len(), 256 * 256 * 4);
+        debug_assert_eq!(ICON_32.len(), 32 * 32 * 4);
+
+        let icon_256 = Icon::from_rgba(ICON_256.to_vec(), 256, 256);
+        let icon_32 = Icon::from_rgba(ICON_32.to_vec(), 32, 32);
+
+        window.set_title("Oxidised");
+
+        if let (Ok(big_icon), Ok(small_icon)) = (icon_256, icon_32) {
+            window.set_taskbar_icon(Some(big_icon));
+            window.set_window_icon(Some(small_icon));
+        }
+
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let window_size = window.inner_size();
 
@@ -770,6 +787,8 @@ impl ApplicationHandler for App {
             })
             .collect();
 
+        window.set_visible(true);
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -802,6 +821,12 @@ impl ApplicationHandler for App {
             frames,
         });
     }
+
+    /* fn exiting(&mut self, _: &ActiveEventLoop) {
+        unsafe {
+            self.device.wait_idle().unwrap();
+        }
+    }*/
 
     fn window_event(
         &mut self,
@@ -960,13 +985,9 @@ impl App {
             return;
         }
 
-        if rcx.recreate_swapchain {
-            // TODO: I have no idea why this is required, since I think I got sync correctly done. But
-            // obviously I am wrong.
-            unsafe {
-                self.device.wait_idle().unwrap();
-            }
+        rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
+        if rcx.recreate_swapchain {
             let (new_swapchain, new_swapchain_images) = rcx
                 .swapchain
                 .recreate(SwapchainCreateInfo {
@@ -1414,17 +1435,6 @@ impl App {
                     ..Default::default()
                 })
                 .unwrap();
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Upload".to_string(),
-                    color: [0.5, 0.5, 0.9, 1.0],
-                    ..Default::default()
-                })
-                .unwrap();
-            rcx.imgui_renderer.upload(&mut graphics_builder, draw_data);
-            unsafe {
-                graphics_builder.end_debug_utils_label().unwrap();
-            }
 
             graphics_builder
                 .begin_debug_utils_label(DebugUtilsLabel {

@@ -54,18 +54,7 @@ impl ComponentRegistry {
         self.type_to_bit.get(type_id).copied()
     }
 
-    /// Get the TypeId for a bit index
-    pub fn type_for_bit(&self, bit: u8) -> TypeId {
-        self.bit_to_type[bit as usize]
-    }
-
-    /// Get serialiser for a bit index
     pub fn serialiser_for_bit(&self, bit: u8) -> &dyn ComponentSerialiser {
         self.serialisers[bit as usize].as_ref()
-    }
-
-    /// Optional: debug / editor only
-    pub fn get_type_name(&self, type_id: &TypeId) -> Option<&'static str> {
-        self.type_names.get(type_id).copied()
     }
 }

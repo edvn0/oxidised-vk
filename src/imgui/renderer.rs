@@ -1,21 +1,18 @@
 use crate::{
-    MAX_FRAMES_IN_FLIGHT,
     image::{ImageInfo, create_image},
     imgui::shaders,
     mesh::ImageViewSampler,
 };
+
 use imgui::{DrawCmd, DrawData};
 use std::{collections::BTreeMap, sync::Arc};
-use vulkano::pipeline::DynamicState;
-use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
-use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
-use vulkano::pipeline::graphics::viewport::{Scissor, Viewport};
+
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
-    command_buffer::{
-        AutoCommandBufferBuilder, CopyBufferInfo, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
-        PrimaryCommandBufferAbstract, allocator::StandardCommandBufferAllocator,
+    buffer::{
+        BufferContents, BufferUsage, Subbuffer,
+        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
     },
+    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer},
     descriptor_set::{
         DescriptorSet, WriteDescriptorSet,
         allocator::StandardDescriptorSetAllocator,
@@ -26,12 +23,8 @@ use vulkano::{
     },
     device::{Device, Queue},
     format::Format,
-    image::{
-        Image, ImageCreateInfo, ImageType, ImageUsage,
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
-        view::ImageView,
-    },
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
+    memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
         graphics::{
@@ -40,14 +33,17 @@ use vulkano::{
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::RasterizationState,
+            subpass::PipelineRenderingCreateInfo,
             vertex_input::VertexInputState,
-            viewport::ViewportState,
+            viewport::{Scissor, Viewport, ViewportState},
         },
         layout::{PipelineLayout, PipelineLayoutCreateInfo, PushConstantRange},
     },
     shader::ShaderStages,
-    sync::GpuFuture,
 };
+
+use vulkano::pipeline::DynamicState;
+use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
 
 #[repr(C)]
 #[derive(BufferContents, Copy, Clone)]
@@ -55,17 +51,6 @@ pub struct OwnedDrawVert {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
     pub col: [u8; 4],
-}
-
-struct FrameBuffers {
-    vb_gpu: Subbuffer<[OwnedDrawVert]>,
-    ib_gpu: Subbuffer<[u16]>,
-
-    vb_staging: Subbuffer<[OwnedDrawVert]>,
-    ib_staging: Subbuffer<[u16]>,
-
-    vtx_capacity: usize,
-    idx_capacity: usize,
 }
 
 pub struct ImGuiRenderer {
@@ -80,7 +65,8 @@ pub struct ImGuiRenderer {
 
     sampler_clamp: Arc<Sampler>,
 
-    frames: FrameBuffers,
+    vtx_alloc: SubbufferAllocator,
+    idx_alloc: SubbufferAllocator,
 }
 
 impl ImGuiRenderer {
@@ -105,22 +91,47 @@ impl ImGuiRenderer {
         )
         .unwrap();
 
-        let (pipeline, set) = Self::create_pipeline(
+        let (pipeline, texture_set) = Self::create_pipeline(
             descriptor_set_allocator.clone(),
             device.clone(),
             image_format,
             sampler_clamp.clone(),
         );
 
+        let vtx_alloc = SubbufferAllocator::new(
+            allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::VERTEX_BUFFER
+                    | BufferUsage::STORAGE_BUFFER
+                    | BufferUsage::SHADER_DEVICE_ADDRESS,
+                memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS
+                    | MemoryTypeFilter::PREFER_DEVICE,
+                arena_size: 1024 * 1024,
+                ..Default::default()
+            },
+        );
+
+        let idx_alloc = SubbufferAllocator::new(
+            allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::INDEX_BUFFER,
+                memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS
+                    | MemoryTypeFilter::PREFER_DEVICE,
+                arena_size: 512 * 1024,
+                ..Default::default()
+            },
+        );
+
         Self {
-            allocator: allocator.clone(),
+            allocator,
             descriptor_set_allocator,
             pipeline,
-            texture_set: set,
-            free_texture_ids: Vec::new(),
-            frames: Self::empty_frame(allocator.clone()),
-            sampler_clamp,
+            texture_set,
             textures: Vec::new(),
+            free_texture_ids: Vec::new(),
+            sampler_clamp,
+            vtx_alloc,
+            idx_alloc,
         }
     }
 
@@ -128,7 +139,7 @@ impl ImGuiRenderer {
         &mut self,
         imgui: &mut imgui::Context,
         queue: Arc<Queue>,
-        cb_allocator: Arc<StandardCommandBufferAllocator>,
+        cb_allocator: Arc<vulkano::command_buffer::allocator::StandardCommandBufferAllocator>,
     ) {
         let fonts = imgui.fonts();
         let atlas = fonts.build_rgba32_texture();
@@ -136,31 +147,20 @@ impl ImGuiRenderer {
         let image_info = ImageInfo::new(
             [atlas.width as u32, atlas.height as u32],
             Format::R8G8B8A8_UNORM,
-            String::from("Font Atlas"),
+            "ImGui Font Atlas".into(),
             self.sampler_clamp.clone(),
         );
 
-        let tex = create_image(
-            queue.clone(),
-            cb_allocator.clone(),
+        let image = create_image(
+            queue,
+            cb_allocator,
             self.allocator.clone(),
             &atlas.data,
             image_info,
         );
 
-        let tex_id = self.register_texture(tex);
-        fonts.tex_id = imgui::TextureId::from(tex_id);
-    }
-
-    pub fn upload(
-        &mut self,
-        cmd: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        draw_data: &DrawData,
-    ) {
-        let fb = &mut self.frames;
-
-        ensure_capacity(&self.allocator, fb, draw_data);
-        upload_buffers(cmd, fb, draw_data);
+        let id = self.register_texture(image);
+        fonts.tex_id = imgui::TextureId::from(id);
     }
 
     pub fn draw(
@@ -169,18 +169,52 @@ impl ImGuiRenderer {
         draw_data: &DrawData,
         vp: (&Viewport, &Scissor),
     ) {
-        let fb = &self.frames;
+        if draw_data.total_vtx_count == 0 || draw_data.total_idx_count == 0 {
+            return;
+        }
 
-        let vb_addr = fb.vb_gpu.device_address().unwrap();
-        let ib = fb.ib_gpu.clone();
+        let vtx_buf: Subbuffer<[OwnedDrawVert]> = self
+            .vtx_alloc
+            .allocate_slice(draw_data.total_vtx_count as u64)
+            .unwrap();
+        let idx_buf: Subbuffer<[u16]> = self
+            .idx_alloc
+            .allocate_slice(draw_data.total_idx_count as u64)
+            .unwrap();
+
+        {
+            let mut vtx = vtx_buf.write().unwrap();
+            let mut idx = idx_buf.write().unwrap();
+
+            let mut vo = 0;
+            let mut io = 0;
+
+            for list in draw_data.draw_lists() {
+                for (dst, src) in vtx[vo..vo + list.vtx_buffer().len()]
+                    .iter_mut()
+                    .zip(list.vtx_buffer())
+                {
+                    dst.pos = src.pos;
+                    dst.uv = src.uv;
+                    dst.col = src.col;
+                }
+
+                idx[io..io + list.idx_buffer().len()].copy_from_slice(list.idx_buffer());
+
+                vo += list.vtx_buffer().len();
+                io += list.idx_buffer().len();
+            }
+        }
+
+        let vb_addr = vtx_buf.device_address().unwrap();
 
         cmd.bind_pipeline_graphics(self.pipeline.clone()).unwrap();
-        cmd.bind_index_buffer(ib).unwrap();
+        cmd.bind_index_buffer(idx_buf).unwrap();
         cmd.bind_descriptor_sets(
             PipelineBindPoint::Graphics,
             self.pipeline.layout().clone(),
             0,
-            vec![self.texture_set.clone()],
+            [self.texture_set.clone()].to_vec(),
         )
         .unwrap();
 
@@ -217,6 +251,7 @@ impl ImGuiRenderer {
                     .unwrap()
                     .set_viewport(0, [viewport.clone()].into_iter().collect())
                     .unwrap();
+
                 unsafe {
                     cmd.draw_indexed(
                         count as u32,
@@ -266,75 +301,6 @@ impl ImGuiRenderer {
         id
     }
 
-    fn empty_frame(allocator: Arc<StandardMemoryAllocator>) -> FrameBuffers {
-        let ib = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        let vb_staging = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        let vb_gpu = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::SHADER_DEVICE_ADDRESS
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        let ib_staging = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            1,
-        )
-        .unwrap();
-
-        FrameBuffers {
-            vb_gpu,
-            ib_gpu: ib,
-            vb_staging,
-            ib_staging,
-            vtx_capacity: 1,
-            idx_capacity: 1,
-        }
-    }
-
     fn create_pipeline(
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         device: Arc<Device>,
@@ -359,8 +325,7 @@ impl ImGuiRenderer {
                         let mut b = DescriptorSetLayoutBinding::descriptor_type(
                             DescriptorType::SampledImage,
                         );
-                        const MAX_IMGUI_TEXTURES: u32 = 1024;
-                        b.descriptor_count = MAX_IMGUI_TEXTURES;
+                        b.descriptor_count = 1024;
                         b.stages = ShaderStages::FRAGMENT;
                         b.binding_flags = DescriptorBindingFlags::PARTIALLY_BOUND
                             | DescriptorBindingFlags::UPDATE_AFTER_BIND;
@@ -369,9 +334,8 @@ impl ImGuiRenderer {
                     (1, {
                         let mut b =
                             DescriptorSetLayoutBinding::descriptor_type(DescriptorType::Sampler);
-                        b.descriptor_count = 1;
                         b.stages = ShaderStages::FRAGMENT;
-                        b.immutable_samplers = vec![sampler_clamp.clone()];
+                        b.immutable_samplers = vec![sampler_clamp];
                         b
                     }),
                 ]),
@@ -393,6 +357,7 @@ impl ImGuiRenderer {
             },
         )
         .unwrap();
+
         let mut ci = GraphicsPipelineCreateInfo::layout(layout);
         ci.stages = [
             PipelineShaderStageCreateInfo::new(vs),
@@ -413,9 +378,10 @@ impl ImGuiRenderer {
                 ..ColorBlendAttachmentState::default()
             },
         ));
+
         ci.dynamic_state.insert(DepthTestEnable);
-        ci.dynamic_state.insert(DynamicState::Scissor);
         ci.dynamic_state.insert(DynamicState::Viewport);
+        ci.dynamic_state.insert(DynamicState::Scissor);
         ci.dynamic_state.insert(DepthWriteEnable);
 
         ci.subpass = Some(
@@ -427,127 +393,8 @@ impl ImGuiRenderer {
         );
 
         let pipeline = GraphicsPipeline::new(device.clone(), None, ci).unwrap();
-
-        let texture_set =
-            DescriptorSet::new(descriptor_set_allocator.clone(), set_layout, [], []).unwrap();
+        let texture_set = DescriptorSet::new(descriptor_set_allocator, set_layout, [], []).unwrap();
 
         (pipeline, texture_set)
-    }
-}
-
-fn upload_buffers(
-    cmd: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    fb: &FrameBuffers,
-    draw_data: &DrawData,
-) {
-    let (mut vtx, mut idx) = match (fb.vb_staging.write(), fb.ib_staging.write()) {
-        (Ok(v), Ok(i)) => (v, i),
-        _ => return,
-    };
-
-    let mut vo = 0;
-    let mut io = 0;
-
-    for list in draw_data.draw_lists() {
-        for (d, s) in vtx[vo..vo + list.vtx_buffer().len()]
-            .iter_mut()
-            .zip(list.vtx_buffer())
-        {
-            d.pos = s.pos;
-            d.uv = s.uv;
-            d.col = s.col;
-        }
-
-        idx[io..io + list.idx_buffer().len()].copy_from_slice(list.idx_buffer());
-
-        vo += list.vtx_buffer().len();
-        io += list.idx_buffer().len();
-    }
-
-    cmd.copy_buffer(CopyBufferInfo::buffers(
-        fb.vb_staging.clone(),
-        fb.vb_gpu.clone(),
-    ))
-    .unwrap();
-
-    cmd.copy_buffer(CopyBufferInfo::buffers(
-        fb.ib_staging.clone(),
-        fb.ib_gpu.clone(),
-    ))
-    .unwrap();
-}
-
-fn ensure_capacity(
-    allocator: &Arc<StandardMemoryAllocator>,
-    fb: &mut FrameBuffers,
-    draw_data: &DrawData,
-) {
-    let total_vtx = draw_data.total_vtx_count as usize;
-    let total_idx = draw_data.total_idx_count as usize;
-
-    if total_vtx > fb.vtx_capacity {
-        fb.vb_staging = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            total_vtx as u64,
-        )
-        .unwrap();
-
-        fb.vb_gpu = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::SHADER_DEVICE_ADDRESS
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            total_vtx as u64,
-        )
-        .unwrap();
-
-        fb.vtx_capacity = total_vtx;
-    }
-
-    if total_idx > fb.idx_capacity {
-        fb.ib_staging = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            total_idx as u64,
-        )
-        .unwrap();
-
-        fb.ib_gpu = Buffer::new_slice(
-            allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            total_idx as u64,
-        )
-        .unwrap();
-
-        fb.idx_capacity = total_idx;
     }
 }

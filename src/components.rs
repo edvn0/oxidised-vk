@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use crate::mesh::MeshAsset;
 use crate::TransformTRS;
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
 
@@ -15,10 +13,7 @@ pub struct MeshComponentSerialized {
     pub mesh_name: String,
 }
 impl MeshComponent {
-   pub fn from_serialized(
-        s: MeshComponentSerialized,
-        registry: &MeshRegistry,
-    ) -> Self {
+    pub fn from_serialized(s: MeshComponentSerialized, registry: &MeshRegistry) -> Self {
         let handle = registry
             .resolve(&s.mesh_name)
             .expect("mesh not found in registry");
@@ -26,7 +21,6 @@ impl MeshComponent {
         Self { mesh: handle }
     }
 }
-
 
 pub struct MaterialOverride {
     pub material_id: u32,
