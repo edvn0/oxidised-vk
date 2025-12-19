@@ -30,7 +30,11 @@ use crate::mesh_registry::{MeshHandle, MeshRegistry};
 use crate::render_context::{
     Culling, FrameResources, MeshDrawStream, RenderContext, TransformTRS, Winding,
 };
-use crate::render_passes::{Composite, MRT, MRTLighting, SwapchainPass};
+use crate::render_passes::{
+    Composite, CompositePass, FrameContext, GBufferPass, ImGuiPass, MRT, MRTLighting,
+    MRTLightingPass, PreDepthPass, PresentPass, RenderPass, RenderRecorder, RenderResources,
+    SwapchainPass,
+};
 use crate::scene::{Scene, WorldExt};
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
@@ -881,96 +885,53 @@ impl App {
 
         rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
 
-        rcx.mrt_pass
-            .record_predepth_pass(
-                &mut graphics_builder,
-                &rcx,
-                &self.descriptor_set_allocator,
-                &rcx.mesh_streams,
-                self.cull_backfaces,
-                self.clockwise_front_face,
-            )
-            .unwrap();
+        let frame = FrameContext {
+            frame_index: rcx.current_frame,
+            viewport: &rcx.viewport,
+            scissor: &rcx.scissor,
+            culling: self.cull_backfaces,
+            winding: self.clockwise_front_face,
+        };
 
-        rcx.mrt_pass
-            .record_gbuffer_pass(
-                &mut graphics_builder,
-                &rcx,
-                &self.descriptor_set_allocator,
-                &rcx.mesh_streams,
-                &rcx.white_image_sampler,
-                self.cull_backfaces,
-                self.clockwise_front_face,
-            )
-            .unwrap();
+        let mut recorder = RenderRecorder {
+            cmd: &mut graphics_builder,
+            imgui_context: &mut rcx.imgui_context,
+            imgui_renderer: &mut rcx.imgui_renderer,
+        };
+        let frame_descriptor_set = rcx.context_descriptor_set.for_frame(rcx.current_frame);
 
-        rcx.mrt_lighting
-            .record_lighting_pass(&mut graphics_builder, &rcx)
-            .unwrap();
+        let resources = RenderResources {
+            mesh_streams: &rcx.mesh_streams,
+            descriptor_sets: &self.descriptor_set_allocator,
+            white_sampler: &rcx.white_image_sampler,
+            swapchain_views: &rcx.swapchain_pass.attachment_image_views,
+            viewport: &rcx.viewport,
+            scissor: &rcx.scissor,
+            current_frame: rcx.current_frame,
+            frame_descriptor_set: frame_descriptor_set.clone(),
+        };
 
-        rcx.bloom_pass.run(
-            &mut graphics_builder,
-            &self.descriptor_set_allocator,
-            rcx.mrt_lighting.image_view.clone(),
-            1.0, // bloom intensity
-            1.0, // threshold
-        );
+        let passes: [&dyn RenderPass; _] = [
+            &PreDepthPass { mrt: &rcx.mrt_pass },
+            &GBufferPass { mrt: &rcx.mrt_pass },
+            &MRTLightingPass {
+                mrt_lighting: &rcx.mrt_lighting,
+            },
+            &CompositePass {
+                composite: &rcx.composite,
+                exposure: 1.0,
+            },
+            &PresentPass {
+                swapchain: &rcx.swapchain_pass,
+                image_index: image_index.try_into().unwrap(),
+            },
+            &ImGuiPass {
+                image_index: image_index.try_into().unwrap(),
+            },
+        ];
 
-        rcx.composite
-            .record_composite_pass(&mut graphics_builder, &rcx.scissor, 1.0)
-            .unwrap();
-
-        rcx.swapchain_pass
-            .record_present_pass(&mut graphics_builder, &rcx.scissor, image_index as usize)
-            .unwrap();
-
-        {
-            let draw_data = rcx.imgui_context.render();
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "ImGui".to_string(),
-                    color: [0.5, 0.5, 0.9, 1.0],
-                    ..Default::default()
-                })
-                .unwrap();
-
-            graphics_builder
-                .begin_debug_utils_label(DebugUtilsLabel {
-                    label_name: "Render".to_string(),
-                    color: [0.9, 0.5, 0.5, 1.0],
-                    ..Default::default()
-                })
-                .unwrap()
-                .begin_rendering(RenderingInfo {
-                    render_area_extent: rcx.scissor.extent,
-                    render_area_offset: rcx.scissor.offset,
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Load,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: None,
-                        ..RenderingAttachmentInfo::image_view(
-                            rcx.swapchain_pass.attachment_image_views[image_index as usize].clone(),
-                        )
-                    })],
-                    ..Default::default()
-                })
-                .unwrap();
-
-            rcx.imgui_renderer.draw(
-                &mut graphics_builder,
-                draw_data,
-                (&rcx.viewport, &rcx.scissor),
-            );
-
-            unsafe {
-                graphics_builder
-                    .end_rendering()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap()
-                    .end_debug_utils_label()
-                    .unwrap();
-            }
+        for pass in passes {
+            pass.record(&mut recorder, &frame, &resources).unwrap();
         }
 
         let cmd_buf = graphics_builder.build().unwrap();
