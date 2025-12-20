@@ -15,12 +15,8 @@ layout(set = 0, binding = 0, std140) uniform UBO {
     vec4 sun_direction;
 };
 
-struct Transform {
-    mat4 t;
-};
-
 layout(set = 1, binding = 1, std430) readonly buffer Transforms {
-    Transform transforms[];
+    mat4 transforms[];
 };
 
 layout(set = 1, binding = 2, std430) readonly buffer MaterialIds {
@@ -33,7 +29,7 @@ void main() {
 
     uint material_index =material_ids[draw_id];
 
-    mat4 model = transforms[object_index] . t;
+    mat4 model = transforms[object_index];
 
     v_material_id = material_index;
 

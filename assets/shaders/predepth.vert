@@ -9,15 +9,12 @@ layout(set = 0, binding = 0, std140) uniform UBO {
     vec4 sun_direction;
 };
 
-struct Transform {
-    mat4 t;
-};
-layout(set = 1, binding = 1, std140) readonly buffer SSBO {
-    Transform transforms[];
+layout(set = 1, binding = 1, std430) readonly buffer Transforms {
+    mat4 transforms[];
 };
 
 void main() {
-    mat4 model = transforms[gl_InstanceIndex] . t;
+    mat4 model = transforms[gl_InstanceIndex];
     vec4 world_pos = model * vec4(position, 1.0);
     gl_Position = projection * ( view * world_pos );
 }

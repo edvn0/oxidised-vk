@@ -1,9 +1,24 @@
-use crate::TransformTRS;
+use glm::{Quat, Vec3};
+
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
 
 #[derive(Clone, Copy)]
 pub struct Transform {
-    pub transform: TransformTRS,
+    pub position: Vec3,
+    pub scale: Vec3,
+    pub rotation: Quat,
+}
+
+impl Transform {
+    pub fn to_matrix(&self) -> [f32; 16] {
+        let t = glm::translate(&glm::identity(), &self.position);
+        let r = glm::quat_to_mat4(&self.rotation.normalize());
+        let s = glm::scale(&glm::identity(), &self.scale);
+
+        let mat = t * r * s;
+
+        mat.as_slice().try_into().unwrap()
+    }
 }
 
 pub struct MeshComponent {

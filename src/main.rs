@@ -24,7 +24,7 @@ use crate::components::{MeshComponent, Transform, Visible};
 use crate::image::{ImageDimensions, ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
-use crate::main_helpers::FrameDescriptorSet;
+use crate::main_helpers::{FrameDescriptorSet, generate_identity_lut_3d};
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
 use crate::mesh_registry::{MeshHandle, MeshRegistry};
 use crate::render_context::{
@@ -44,8 +44,9 @@ use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{DrawSubmission, FrameSubmission};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use ::imgui::{Condition, Context};
+use glm::{TVec3, Vec3, vec3};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
-use nalgebra::{Matrix4, Translation3};
+use nalgebra::{Matrix4, Translation3, UnitQuaternion};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
@@ -359,7 +360,7 @@ impl App {
     }
 }
 
-fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
+fn generate_random_transforms(count: u64) -> Vec<components::Transform> {
     let mut rng = rand::rng();
     let mut transforms = Vec::with_capacity(count as usize);
 
@@ -372,15 +373,14 @@ fn generate_random_transforms(count: u64) -> Vec<TransformTRS> {
         let rx = rng.random_range(0.0..std::f32::consts::TAU);
         let ry = rng.random_range(0.0..std::f32::consts::TAU);
         let rz = rng.random_range(0.0..std::f32::consts::TAU);
-        let rotation = nalgebra::Rotation3::from_euler_angles(rx, ry, rz);
+        let rotation = UnitQuaternion::from_euler_angles(rx, ry, rz).into_inner();
 
         let scale = rng.random_range(1.0..5.0);
-        let scale_matrix = Matrix4::new_scaling(scale);
 
-        let transform = translation.to_homogeneous() * rotation.to_homogeneous() * scale_matrix;
-
-        transforms.push(TransformTRS {
-            trs: transform.as_slice().try_into().unwrap(),
+        transforms.push(components::Transform {
+            position: translation.vector,
+            rotation,
+            scale: vec3(scale, scale, scale),
         });
     }
 
@@ -640,7 +640,7 @@ impl ApplicationHandler for App {
 
             for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
                 self.scene.add_entity((
-                    Transform { transform: trs },
+                    trs,
                     MeshComponent {
                         mesh: viking_handle,
                     },
@@ -650,7 +650,7 @@ impl ApplicationHandler for App {
 
             for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
                 self.scene.add_entity((
-                    Transform { transform: trs },
+                    trs,
                     MeshComponent {
                         mesh: suzanne_handle,
                     },
@@ -1781,27 +1781,4 @@ fn update_material_ids_for_mesh(mesh: &MeshAsset, material_ids: &mut [u32]) {
             draw_id += 1;
         }
     }
-}
-
-fn generate_identity_lut_3d(size: u32) -> Vec<u8> {
-    let mut data = Vec::with_capacity((size * size * size * 4) as usize);
-
-    let max = (size - 1) as f32;
-
-    for b in 0..size {
-        for g in 0..size {
-            for r in 0..size {
-                let rf = r as f32 / max;
-                let gf = g as f32 / max;
-                let bf = b as f32 / max;
-
-                data.push((rf * 255.0).round() as u8);
-                data.push((gf * 255.0).round() as u8);
-                data.push((bf * 255.0).round() as u8);
-                data.push(255);
-            }
-        }
-    }
-
-    data
 }

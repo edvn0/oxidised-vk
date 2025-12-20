@@ -94,7 +94,7 @@ fn collect_draws(
 ) {
     submission.draws.push(DrawSubmission {
         mesh: mesh.mesh,
-        transform: transform.transform,
+        transform: transform.to_matrix(),
         override_material: material.map(|m| m.material_id),
     });
 }

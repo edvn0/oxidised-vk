@@ -87,11 +87,7 @@ impl From<Winding> for FrontFace {
     }
 }
 
-#[repr(C)]
-#[derive(BufferContents, Copy, Clone)]
-pub struct TransformTRS {
-    pub trs: [f32; 16],
-}
+pub type TransformTRS = [f32; 16];
 
 pub struct MeshDrawStream {
     pub mesh: Arc<MeshAsset>,
