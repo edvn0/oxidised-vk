@@ -1,0 +1,23 @@
+# --- Rust build output ---
+target/
+
+# --- Git ---
+.git/
+.gitignore
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- CI / local scripts ---
+docker-compose.yml
+Dockerfile*
