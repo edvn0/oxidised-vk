@@ -1,6 +1,6 @@
 use glm::{Quat, Vec3};
 
-use crate::mesh_registry::{MeshHandle, MeshRegistry};
+use crate::mesh_registry::MeshHandle;
 
 #[derive(Clone, Copy)]
 pub struct Transform {
@@ -24,6 +24,7 @@ impl Transform {
 pub struct MeshComponent {
     pub mesh: MeshHandle,
 }
+/*
 pub struct MeshComponentSerialized {
     pub mesh_name: String,
 }
@@ -36,6 +37,7 @@ impl MeshComponent {
         Self { mesh: handle }
     }
 }
+*/
 
 pub struct MaterialOverride {
     pub material_id: u32,

@@ -17,16 +17,16 @@ mod shader_bindings;
 mod submission;
 mod texture_cache;
 mod vertex;
+mod windowing;
 
-use crate::bloom_pass::{BloomPass, BloomSettings, bloom_limits};
+use crate::bloom_pass::{BloomPass, BloomSettings};
 use crate::camera::Camera;
-use crate::components::{MeshComponent, Transform, Visible};
+use crate::components::{MeshComponent, Visible};
 use crate::image::{ImageDimensions, ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
 use crate::main_helpers::{FrameDescriptorSet, generate_identity_lut_3d};
 use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
-use crate::mesh_registry::{MeshHandle, MeshRegistry};
 use crate::render_context::{
     Culling, FrameResources, MeshDrawStream, RenderContext, TransformTRS, Winding,
 };
@@ -39,44 +39,41 @@ use crate::render_passes::recorder::RenderRecorder;
 use crate::render_passes::recordings::{
     Composite, CompositeSettings, MRT, MRTLighting, SwapchainPass,
 };
-use crate::scene::{Scene, WorldExt};
+use crate::scene::Scene;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
-use crate::submission::{DrawSubmission, FrameSubmission};
+use crate::submission::FrameSubmission;
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
+use crate::windowing::set_window_icons;
 use ::imgui::{Condition, Context};
-use glm::{TVec3, Vec3, vec3};
+use glm::vec3;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
-use nalgebra::{Matrix4, Translation3, UnitQuaternion};
+use nalgebra::{Translation3, UnitQuaternion};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::path::Path;
-use std::sync::RwLock;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
-use vulkano::format::{ClearValue, FormatFeatures};
+use vulkano::format::FormatFeatures;
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
     SamplerMipmapMode,
 };
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{ImageAspects, ImageLayout, ImageSubresourceRange, ImageTiling, SampleCount};
+use vulkano::image::{ImageAspects, ImageSubresourceRange};
 use vulkano::instance::InstanceExtensions;
-use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexInputState};
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::sync::SharingMode;
 use vulkano::{
     DeviceSize, Validated, Version, VulkanError, VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, RenderingAttachmentInfo, RenderingInfo,
-        allocator::StandardCommandBufferAllocator,
+        AutoCommandBufferBuilder, CommandBufferUsage, allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
         DescriptorSet, WriteDescriptorSet,
@@ -90,13 +87,9 @@ use vulkano::{
     format::Format,
     image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::ImageView},
     instance::{Instance, InstanceCreateInfo},
-    memory::allocator::{
-        AllocationCreateInfo, FreeListAllocator, GenericMemoryAllocator, MemoryTypeFilter,
-        StandardMemoryAllocator,
-    },
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
+        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
         graphics::{
             GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -109,7 +102,6 @@ use vulkano::{
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
-    render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     shader::ShaderStages,
     swapchain::{
         Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image,
@@ -118,8 +110,6 @@ use vulkano::{
 };
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId};
-use winit::platform::windows::WindowExtWindows;
-use winit::window::Icon;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -142,18 +132,6 @@ pub struct GpuUploadContext {
     pub queue: Arc<Queue>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
-}
-
-impl GpuUploadContext {
-    pub fn create_image(&self, value: &[u8], image_info: ImageInfo) -> Arc<ImageViewSampler> {
-        create_image(
-            self.queue.clone(),
-            self.command_buffer_allocator.clone(),
-            self.memory_allocator.clone(),
-            value,
-            image_info,
-        )
-    }
 }
 
 enum PostProcessPanel {
@@ -389,23 +367,17 @@ fn generate_random_transforms(count: u64) -> Vec<components::Transform> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let mut attribs = Window::default_attributes().with_visible(false);
-        attribs.inner_size = Some(PhysicalSize::new(2300, 1024).into());
-        let window = Arc::new(event_loop.create_window(attribs).unwrap());
-        const ICON_256: &[u8] = include_bytes!("../assets/engine/icon_256.rgba");
-        const ICON_32: &[u8] = include_bytes!("../assets/engine/icon_32.rgba");
-        debug_assert_eq!(ICON_256.len(), 256 * 256 * 4);
-        debug_assert_eq!(ICON_32.len(), 32 * 32 * 4);
-
-        let icon_256 = Icon::from_rgba(ICON_256.to_vec(), 256, 256);
-        let icon_32 = Icon::from_rgba(ICON_32.to_vec(), 32, 32);
-
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(PhysicalSize::new(1600, 800)),
+                )
+                .unwrap(),
+        );
         window.set_title("Oxidised");
-
-        if let (Ok(big_icon), Ok(small_icon)) = (icon_256, icon_32) {
-            window.set_taskbar_icon(Some(big_icon));
-            window.set_window_icon(Some(small_icon));
-        }
+        set_window_icons(&window);
 
         let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let window_size = window.inner_size();
@@ -886,7 +858,6 @@ impl App {
             }
         });
         rcx.winit_platform.prepare_render(ui, &rcx.window);
-
         rcx.frame_submission.clear_all();
 
         self.scene.update();
@@ -971,7 +942,7 @@ impl App {
         rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
 
         let frame = FrameContext {
-            frame_index: rcx.current_frame,
+            _frame_index: rcx.current_frame,
             viewport: &rcx.viewport,
             scissor: &rcx.scissor,
             culling: self.cull_backfaces,

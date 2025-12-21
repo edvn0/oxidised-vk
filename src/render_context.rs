@@ -8,7 +8,7 @@ use imgui::Context;
 use imgui_winit_support::WinitPlatform;
 use vulkano::{
     DeviceSize,
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::DrawIndexedIndirectCommand,
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::graphics::{

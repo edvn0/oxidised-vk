@@ -32,7 +32,7 @@ pub mod data {
     use super::*;
 
     pub struct FrameContext<'a> {
-        pub frame_index: usize,
+        pub _frame_index: usize,
         pub viewport: &'a Viewport,
         pub scissor: &'a Scissor,
         pub culling: Culling,
@@ -306,7 +306,6 @@ pub mod recordings {
 
     use crate::{
         engine_shaders,
-        imgui::settings,
         render_passes::data::{RenderPassError, RenderPassResult},
     };
 

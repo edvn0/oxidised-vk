@@ -9,9 +9,8 @@ use vulkano::{
     device::{DeviceOwned, Queue},
     format::Format,
     image::{
-        Image, ImageCreateInfo, ImageType, ImageUsage, max_mip_levels,
-        sampler::{LOD_CLAMP_NONE, Sampler},
-        view::{ImageView, ImageViewCreateInfo, ImageViewType},
+        Image, ImageCreateInfo, ImageType, ImageUsage, max_mip_levels, sampler::Sampler,
+        view::ImageView,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     sync::GpuFuture,
