@@ -7,7 +7,6 @@ pub struct BindlessTextureIndex(pub u32);
 impl BindlessTextureIndex {
     pub const WHITE: Self = Self(0);
 
-    #[inline(always)]
     pub fn raw(self) -> u32 {
         self.0
     }
@@ -39,18 +38,15 @@ impl TextureCache {
 }
 
 impl TextureCache {
-    #[inline(always)]
     pub fn from_gltf_texture(&self, tex: &gltf::texture::Texture) -> BindlessTextureIndex {
         self.get(tex.source().index())
     }
 
-    #[inline(always)]
     pub fn from_opt_info(&self, tex: Option<gltf::texture::Info>) -> BindlessTextureIndex {
         tex.map(|t| self.from_gltf_texture(&t.texture()))
             .unwrap_or(self.fallback)
     }
 
-    #[inline(always)]
     pub fn from_normal_texture(
         &self,
         tex: Option<gltf::material::NormalTexture>,
@@ -59,7 +55,6 @@ impl TextureCache {
             .unwrap_or(self.fallback)
     }
 
-    #[inline(always)]
     pub fn from_ao_texture(
         &self,
         tex: Option<gltf::material::OcclusionTexture>,

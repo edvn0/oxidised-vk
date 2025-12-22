@@ -520,7 +520,7 @@ pub mod recordings {
                                 .take(256),
                         ),
                         WriteDescriptorSet::buffer(1, stream.transforms[current_frame].clone()),
-                        WriteDescriptorSet::buffer(2, stream.material_ids.clone()),
+                        WriteDescriptorSet::buffer(2, stream.material_ids[current_frame].clone()),
                         WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
                     ],
                     [],

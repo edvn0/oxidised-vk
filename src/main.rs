@@ -192,7 +192,6 @@ impl App {
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
-            khr_timeline_semaphore: true,
             ..DeviceExtensions::empty()
         };
 
@@ -314,6 +313,8 @@ impl App {
             memory_allocator: memory_allocator.clone(),
         };
 
+        let now = Instant::now();
+
         Ok(App {
             instance,
             device,
@@ -325,7 +326,7 @@ impl App {
             command_buffer_allocator,
             input_state: InputState::new(),
             camera: Camera::new(),
-            last_frame: Instant::now(),
+            last_frame: now,
             rcx: None,
             cull_backfaces: Culling::Back,
             clockwise_front_face: Winding::CounterClockwise,
@@ -498,24 +499,28 @@ impl ApplicationHandler for App {
                 .unwrap()
             });
 
-            let material_ids = Buffer::new_slice::<u32>(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                draw_count as DeviceSize,
-            )
-            .unwrap();
+            let material_ids = std::array::from_fn(|_| {
+                Buffer::new_slice::<u32>(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::STORAGE_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    draw_count as DeviceSize,
+                )
+                .unwrap()
+            });
 
             {
-                let mut w = material_ids.write().unwrap();
-                update_material_ids_for_mesh(mesh, &mut w);
+                for mat in &material_ids {
+                    let mut w = mat.write().unwrap();
+                    update_material_ids_for_mesh(mesh, &mut w);
+                }
             }
 
             let transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT] =
@@ -796,13 +801,6 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let rcx = self.rcx.as_mut().unwrap();
-
-        let now = Instant::now();
-        let delta = now - self.last_frame;
-        self.last_frame = now;
-
-        rcx.imgui_context.io_mut().update_delta_time(delta);
-
         rcx.winit_platform
             .prepare_frame(rcx.imgui_context.io_mut(), rcx.window.as_ref())
             .expect("imgui prepare_frame");
@@ -814,6 +812,15 @@ impl ApplicationHandler for App {
 impl App {
     fn render_frame(&mut self) {
         let rcx = self.rcx.as_mut().unwrap();
+
+        let now = Instant::now();
+        let mut dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        dt = dt.clamp(0.0, 0.05);
+
+        rcx.imgui_context
+            .io_mut()
+            .update_delta_time(std::time::Duration::from_secs_f32(dt));
 
         let ui = rcx.imgui_context.new_frame();
         ui.window("Hello world")
@@ -870,10 +877,6 @@ impl App {
 
         submission.drain_draws_into(&mut rcx.frame_submission.draws);
         rcx.build_frame(self.memory_allocator.clone());
-
-        let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32();
-        self.last_frame = now;
 
         self.camera.update_from_input(&self.input_state, dt);
 

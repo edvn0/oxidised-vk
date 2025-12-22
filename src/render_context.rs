@@ -92,7 +92,7 @@ pub type TransformTRS = [f32; 16];
 pub struct MeshDrawStream {
     pub mesh: Arc<MeshAsset>,
     pub instance_count: u32,
-    pub material_ids: Subbuffer<[u32]>,
+    pub material_ids: [Subbuffer<[u32]>; MAX_FRAMES_IN_FLIGHT],
     pub indirect: [Subbuffer<[DrawIndexedIndirectCommand]>; MAX_FRAMES_IN_FLIGHT],
     pub transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
 }
@@ -100,7 +100,7 @@ pub struct MeshDrawStream {
 impl MeshDrawStream {
     pub fn new(
         mesh: Arc<MeshAsset>,
-        material_ids: Subbuffer<[u32]>,
+        material_ids: [Subbuffer<[u32]>; MAX_FRAMES_IN_FLIGHT],
         indirect: [Subbuffer<[DrawIndexedIndirectCommand]>; MAX_FRAMES_IN_FLIGHT],
         transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT],
     ) -> Self {
@@ -201,16 +201,33 @@ impl RenderContext {
             let stream = self.mesh_streams.get_mut(&mesh_handle).unwrap();
 
             let required = draws.len();
+            let current_frame = self.current_frame;
 
-            let current = &stream.transforms[self.current_frame];
-            if current.len() < required as u64 {
+            let current_len = stream.transforms[current_frame].len() as usize;
+
+            if current_len < required {
                 let new_capacity = required
                     .checked_next_power_of_two()
-                    .unwrap_or(required as usize)
+                    .unwrap_or(required)
                     .max(1);
 
-                for slot in &mut stream.transforms {
-                    *slot = Buffer::new_slice::<TransformTRS>(
+                for i in 0..MAX_FRAMES_IN_FLIGHT {
+                    stream.transforms[i] = Buffer::new_slice::<TransformTRS>(
+                        allocator.clone(),
+                        BufferCreateInfo {
+                            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                            ..Default::default()
+                        },
+                        AllocationCreateInfo {
+                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                            ..Default::default()
+                        },
+                        new_capacity as DeviceSize,
+                    )
+                    .unwrap();
+
+                    stream.material_ids[i] = Buffer::new_slice::<u32>(
                         allocator.clone(),
                         BufferCreateInfo {
                             usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
@@ -227,18 +244,25 @@ impl RenderContext {
                 }
             }
 
-            if let Ok(mut w) = stream.transforms[self.current_frame].write() {
-                for (i, d) in draws.iter().enumerate() {
-                    w[i] = d.transform;
-                }
-            }
-
             stream.instance_count = required as u32;
 
-            if let Ok(mut cmds) = stream.indirect[self.current_frame].write() {
+            if let Ok(mut cmds) = stream.indirect[current_frame].write() {
                 for cmd in cmds.iter_mut() {
                     cmd.first_instance = 0;
                     cmd.instance_count = stream.instance_count;
+                }
+            }
+
+            debug_assert!(stream.transforms[current_frame].len() as usize >= required);
+            debug_assert!(stream.material_ids[current_frame].len() as usize >= required);
+
+            if let (Ok(mut t), Ok(mut m)) = (
+                stream.transforms[current_frame].write(),
+                stream.material_ids[current_frame].write(),
+            ) {
+                for (i, d) in draws.iter().enumerate() {
+                    t[i] = d.transform;
+                    m[i] = d.override_material.unwrap_or(0);
                 }
             }
         }
