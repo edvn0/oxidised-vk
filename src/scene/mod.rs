@@ -1,4 +1,5 @@
 pub mod entity_uuid;
+pub mod panel;
 pub mod serialisation;
 pub mod world_ext;
 
@@ -80,6 +81,14 @@ impl Scene {
         let world = serialiser.deserialize_world(&mut file)?;
 
         Ok(Self::from_world(world))
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 }
 

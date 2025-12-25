@@ -40,6 +40,7 @@ use crate::render_passes::recordings::{
     Composite, CompositeSettings, MRT, MRTLighting, SwapchainPass,
 };
 use crate::scene::Scene;
+use crate::scene::panel::ScenePanel;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::FrameSubmission;
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
@@ -153,7 +154,9 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     rcx: Option<RenderContext>,
+
     ui_state: AppUIState,
+    scene_panel: ScenePanel,
 
     input_state: InputState,
     camera: Camera,
@@ -335,6 +338,7 @@ impl App {
             ui_state: AppUIState {
                 post_process_panel: PostProcessPanel::Bloom,
             },
+            scene_panel: ScenePanel::new(),
         })
     }
 }
@@ -864,6 +868,8 @@ impl App {
                 }
             }
         });
+        self.scene_panel.draw(ui, self.scene.world_mut());
+
         rcx.winit_platform.prepare_render(ui, &rcx.window);
         rcx.frame_submission.clear_all();
 

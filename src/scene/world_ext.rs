@@ -7,6 +7,10 @@ pub trait WorldExt {
         Option<T>: storage::IntoComponentSource;
 
     fn push_empty_with_uuid(&mut self) -> (Entity, EntityUuid);
+
+    fn has_component<T: 'static>(&self, entity: Entity) -> bool
+    where
+        T: legion::storage::Component;
 }
 
 impl WorldExt for World {
@@ -26,5 +30,14 @@ impl WorldExt for World {
         let uuid = EntityUuid::new();
         let entity = self.push((uuid.clone(),));
         (entity, uuid)
+    }
+
+    fn has_component<T: 'static>(&self, entity: Entity) -> bool
+    where
+        T: legion::storage::Component,
+    {
+        self.entry_ref(entity)
+            .ok()
+            .map_or(false, |e| e.get_component::<T>().is_ok())
     }
 }
