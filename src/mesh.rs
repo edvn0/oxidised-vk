@@ -67,6 +67,40 @@ pub struct GpuMaterial {
     pub _pad1: u32,
     pub _pad2: u32,
 }
+pub mod material_feature_flags {
+    pub const HAS_BASE_COLOR_TEX: u32 = 1 << 0;
+    pub const HAS_NORMAL_TEX: u32 = 1 << 1;
+    pub const HAS_METALLIC_ROUGHNESS_TEX: u32 = 1 << 2;
+    pub const HAS_AO_TEX: u32 = 1 << 3;
+}
+pub mod material_behavior_flags {
+    pub const TRANSPARENT: u32 = 1 << 16;
+    pub const ALPHA_TEST: u32 = 1 << 17;
+    pub const DOUBLE_SIDED: u32 = 1 << 18;
+    pub const CASTS_SHADOWS: u32 = 1 << 19;
+}
+pub const MATERIAL_FLAG_TRANSPARENT: u32 = material_behavior_flags::TRANSPARENT;
+pub const MATERIAL_FLAG_ALPHA_TEST: u32 = material_behavior_flags::ALPHA_TEST;
+pub const MATERIAL_FLAG_DOUBLE_SIDED: u32 = material_behavior_flags::DOUBLE_SIDED;
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum MaterialClass {
+    Opaque,
+    AlphaTest,
+    Transparent,
+}
+
+impl GpuMaterial {
+    pub fn material_class(&self) -> MaterialClass {
+        if (self.flags & material_behavior_flags::TRANSPARENT) != 0 {
+            MaterialClass::Transparent
+        } else if (self.flags & material_behavior_flags::ALPHA_TEST) != 0 {
+            MaterialClass::AlphaTest
+        } else {
+            MaterialClass::Opaque
+        }
+    }
+}
 
 #[derive(Eq, Hash, PartialEq)]
 pub(crate) struct ImageViewSampler {
@@ -142,15 +176,20 @@ impl MaterialAsset {
         normal_tex: BindlessTextureIndex,
         metallic_roughness_tex: BindlessTextureIndex,
         ao_tex: BindlessTextureIndex,
+        behavior_flags: u32,
     ) -> Self {
-        let has = |t: BindlessTextureIndex| (t.raw() != NON_DEFAULT_TEXTURE_WHITE) as u32;
+        let has = |t: BindlessTextureIndex| (t.raw() != DEFAULT_TEXTURE_WHITE) as u32;
 
-        let flags = has(base_colour_tex) << 0
-            | has(normal_tex) << 1
-            | has(metallic_roughness_tex) << 2
-            | has(ao_tex) << 3;
+        let mut flags = 0u32;
 
-        MaterialAsset {
+        flags |= has(base_colour_tex) * material_feature_flags::HAS_BASE_COLOR_TEX;
+        flags |= has(normal_tex) * material_feature_flags::HAS_NORMAL_TEX;
+        flags |= has(metallic_roughness_tex) * material_feature_flags::HAS_METALLIC_ROUGHNESS_TEX;
+        flags |= has(ao_tex) * material_feature_flags::HAS_AO_TEX;
+
+        flags |= behavior_flags;
+
+        Self {
             base_color,
             metallic,
             roughness,
@@ -244,10 +283,10 @@ pub fn upload_build_mesh(
             base_color: [1.0, 1.0, 1.0, 1.0],
             metallic: 0.0,
             roughness: 1.0,
-            base_color_tex: NON_DEFAULT_TEXTURE_WHITE,
-            normal_tex: NON_DEFAULT_TEXTURE_WHITE,
-            metallic_roughness_tex: NON_DEFAULT_TEXTURE_WHITE,
-            ao_tex: NON_DEFAULT_TEXTURE_WHITE,
+            base_color_tex: DEFAULT_TEXTURE_WHITE,
+            normal_tex: DEFAULT_TEXTURE_WHITE,
+            metallic_roughness_tex: DEFAULT_TEXTURE_WHITE,
+            ao_tex: DEFAULT_TEXTURE_WHITE,
             flags: 0,
             ..Default::default()
         });
@@ -362,10 +401,32 @@ pub fn import_gltf(
     ))
 }
 
-const NON_DEFAULT_TEXTURE_WHITE: u32 = 0; // This is the white texture
+const DEFAULT_TEXTURE_WHITE: u32 = 0; // This is the white texture
 
 fn build_gltf_material_cpu(material: &gltf::Material, cache: &TextureCache) -> MaterialAsset {
     let pbr = material.pbr_metallic_roughness();
+
+    let mut behaviour = 0u32;
+
+    if material.double_sided() {
+        behaviour |= material_behavior_flags::DOUBLE_SIDED;
+    }
+
+    match material.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => {}
+        gltf::material::AlphaMode::Mask => {
+            behaviour |= material_behavior_flags::ALPHA_TEST;
+        }
+        gltf::material::AlphaMode::Blend => {
+            behaviour |= material_behavior_flags::TRANSPARENT;
+        }
+    }
+
+    // For now!
+    let shadows = true;
+    if shadows {
+        behaviour |= material_behavior_flags::CASTS_SHADOWS;
+    }
 
     MaterialAsset::new(
         pbr.base_color_factor()[0..3].try_into().unwrap(),
@@ -375,6 +436,7 @@ fn build_gltf_material_cpu(material: &gltf::Material, cache: &TextureCache) -> M
         cache.from_normal_texture(material.normal_texture()),
         cache.from_opt_info(pbr.metallic_roughness_texture()),
         cache.from_ao_texture(material.occlusion_texture()),
+        behaviour,
     )
 }
 

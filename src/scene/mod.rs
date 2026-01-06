@@ -83,10 +83,6 @@ impl Scene {
         Ok(Self::from_world(world))
     }
 
-    pub fn world(&self) -> &World {
-        &self.world
-    }
-
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
@@ -105,5 +101,6 @@ fn collect_draws(
         mesh: mesh.mesh,
         transform: transform.to_matrix(),
         override_material: material.map(|m| m.material_id),
+        submesh: mesh.submeshes.clone(),
     });
 }

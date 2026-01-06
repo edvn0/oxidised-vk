@@ -58,7 +58,7 @@ end
 ---@param path string
 ---@param data string
 local function write_file(path, data)
-    ---@type file
+    ---@type file*
     local f = assert(io.open(path, "wb"))
     f:write(data)
     f:close()

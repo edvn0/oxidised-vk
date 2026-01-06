@@ -1,6 +1,7 @@
 use glm::{Quat, Vec3};
 
 use crate::mesh_registry::MeshHandle;
+use crate::submission::SubmeshSelection;
 
 #[derive(Clone, Copy)]
 pub struct Transform {
@@ -23,7 +24,9 @@ impl Transform {
 
 pub struct MeshComponent {
     pub mesh: MeshHandle,
+    pub submeshes: SubmeshSelection,
 }
+
 /*
 pub struct MeshComponentSerialized {
     pub mesh_name: String,

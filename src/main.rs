@@ -26,7 +26,8 @@ use crate::image::{ImageDimensions, ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
 use crate::input_state::InputState;
 use crate::main_helpers::{FrameDescriptorSet, generate_identity_lut_3d};
-use crate::mesh::{ImageViewSampler, MeshAsset, load_meshes_from_directory};
+use crate::mesh::{ImageViewSampler, MaterialClass, load_meshes_from_directory};
+use crate::mesh_registry::RenderStreamKey;
 use crate::render_context::{
     Culling, FrameResources, MeshDrawStream, RenderContext, TransformTRS, Winding,
 };
@@ -42,12 +43,12 @@ use crate::render_passes::recordings::{
 use crate::scene::Scene;
 use crate::scene::panel::ScenePanel;
 use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
-use crate::submission::FrameSubmission;
+use crate::submission::{FrameSubmission, SubmeshSelection};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use crate::windowing::set_window_icons;
-use ::imgui::{Condition, Context};
+use dear_imgui_rs::{Condition, Context};
+use dear_imgui_winit::{HiDpiMode, WinitPlatform};
 use glm::vec3;
-use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use nalgebra::{Translation3, UnitQuaternion};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
@@ -271,6 +272,7 @@ impl App {
                     dynamic_rendering: true,
                     timeline_semaphore: true,
                     shader_draw_parameters: true,
+                    shader_demote_to_helper_invocation: true,
                     multi_draw_indirect: true,
                     buffer_device_address: true,
                     runtime_descriptor_array: true,
@@ -480,73 +482,77 @@ impl ApplicationHandler for App {
         for (handle, mesh) in meshes.read().unwrap().iter() {
             let draw_count = mesh.lods.len() * mesh.submeshes.len();
 
-            let indirect: [Subbuffer<_>; MAX_FRAMES_IN_FLIGHT] = std::array::from_fn(|_| {
-                Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    mesh.submeshes.iter().map(|sub| DrawIndexedIndirectCommand {
-                        index_count: sub.index_count,
-                        instance_count: 0,
-                        first_index: sub.first_index,
-                        vertex_offset: 0,
-                        first_instance: 0,
-                    }),
-                )
-                .unwrap()
-            });
+            let indirect = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::INDIRECT_BUFFER
+                        | BufferUsage::STORAGE_BUFFER
+                        | BufferUsage::SHADER_DEVICE_ADDRESS,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.submeshes.iter().map(|sub| DrawIndexedIndirectCommand {
+                    index_count: sub.index_count,
+                    instance_count: 0,
+                    first_index: sub.first_index,
+                    vertex_offset: 0,
+                    first_instance: 0,
+                }),
+            )
+            .unwrap();
 
-            let material_ids = std::array::from_fn(|_| {
-                Buffer::new_slice::<u32>(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::STORAGE_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    draw_count as DeviceSize,
-                )
-                .unwrap()
-            });
+            let material_ids = Buffer::new_slice::<u32>(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER | BufferUsage::SHADER_DEVICE_ADDRESS,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                draw_count as DeviceSize,
+            )
+            .unwrap();
 
-            {
-                for mat in &material_ids {
-                    let mut w = mat.write().unwrap();
-                    update_material_ids_for_mesh(mesh, &mut w);
+            if let Ok(mut material_ids) = material_ids.write() {
+                let mut draw_id = 0;
+
+                for _lod in 0..mesh.lods.len() {
+                    for sub in &mesh.submeshes {
+                        material_ids[draw_id] = sub.material_index;
+                        draw_id += 1;
+                    }
                 }
             }
 
-            let transforms: [Subbuffer<[TransformTRS]>; MAX_FRAMES_IN_FLIGHT] =
-                std::array::from_fn(|_| {
-                    Buffer::new_slice::<TransformTRS>(
-                        self.memory_allocator.clone(),
-                        BufferCreateInfo {
-                            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                            ..Default::default()
-                        },
-                        AllocationCreateInfo {
-                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                            ..Default::default()
-                        },
-                        1,
-                    )
-                    .unwrap()
-                });
+            let transforms = Buffer::new_slice::<TransformTRS>(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER
+                        | BufferUsage::TRANSFER_DST
+                        | BufferUsage::SHADER_DEVICE_ADDRESS,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
 
             mesh_streams.insert(
-                handle,
+                RenderStreamKey {
+                    mesh: handle,
+                    material_class: MaterialClass::Opaque,
+                },
                 MeshDrawStream::new(mesh.clone(), material_ids, indirect, transforms),
             );
         }
@@ -624,6 +630,7 @@ impl ApplicationHandler for App {
                     trs,
                     MeshComponent {
                         mesh: viking_handle,
+                        submeshes: SubmeshSelection::All,
                     },
                     Visible,
                 ));
@@ -634,6 +641,18 @@ impl ApplicationHandler for App {
                     trs,
                     MeshComponent {
                         mesh: suzanne_handle,
+                        submeshes: SubmeshSelection::All,
+                    },
+                    Visible,
+                ));
+            }
+
+            for trs in generate_random_transforms(50) {
+                self.scene.add_entity((
+                    trs,
+                    MeshComponent {
+                        mesh: viking_handle,
+                        submeshes: SubmeshSelection::One(94),
                     },
                     Visible,
                 ));
@@ -645,7 +664,7 @@ impl ApplicationHandler for App {
             self.scene = Scene::load_from_file(Path::new("scene_save.scene")).unwrap();
         }
         let mut imgui = Context::create();
-        imgui.set_ini_filename(None);
+        imgui.set_ini_filename(None::<&str>).unwrap();
 
         let mut renderer = ImGuiRenderer::new(
             self.device.clone(),
@@ -661,7 +680,7 @@ impl ApplicationHandler for App {
         );
 
         let mut platform = WinitPlatform::new(&mut imgui); // step 1
-        platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Default); // step 2
+        platform.attach_window(&window, HiDpiMode::Default, &mut imgui); // step 2
 
         let frames = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|i| FrameResources::new(&uniform_buffers[i]))
@@ -720,7 +739,7 @@ impl ApplicationHandler for App {
         let rcx = self.rcx.as_mut().unwrap();
 
         rcx.winit_platform.handle_event(
-            rcx.imgui_context.io_mut(),
+            &mut rcx.imgui_context,
             rcx.window.as_ref(),
             &winit::event::Event::WindowEvent::<()> {
                 window_id: rcx.window.id(),
@@ -751,6 +770,7 @@ impl ApplicationHandler for App {
                             let lod_count = registry
                                 .resolve("viking_room")
                                 .map(|m| registry.get(m))
+                                .unwrap()
                                 .unwrap()
                                 .lods
                                 .len();
@@ -798,6 +818,7 @@ impl ApplicationHandler for App {
     ) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.input_state.rotating
+            && !self.input_state.suppress_mouse
         {
             self.input_state.mouse_delta = (dx as f32, dy as f32);
         }
@@ -806,8 +827,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let rcx = self.rcx.as_mut().unwrap();
         rcx.winit_platform
-            .prepare_frame(rcx.imgui_context.io_mut(), rcx.window.as_ref())
-            .expect("imgui prepare_frame");
+            .prepare_frame(rcx.window.as_ref(), &mut rcx.imgui_context);
 
         rcx.window.request_redraw();
     }
@@ -822,20 +842,19 @@ impl App {
         self.last_frame = now;
         dt = dt.clamp(0.0, 0.05);
 
-        rcx.imgui_context
-            .io_mut()
-            .update_delta_time(std::time::Duration::from_secs_f32(dt));
-
-        let ui = rcx.imgui_context.new_frame();
+        let ui = rcx.imgui_context.frame();
+        let ui_wants_mouse = ui.io().want_capture_mouse();
+        let gizmo_wants_mouse = self.scene_panel.is_gizmo_using();
+        self.input_state.suppress_mouse = ui_wants_mouse || gizmo_wants_mouse;
         ui.window("Hello world")
             .size([300.0, 100.0], Condition::FirstUseEver)
             .build(|| {
                 ui.text("Hello world!");
                 ui.text("こんにちは世界！");
                 ui.text("This...is...imgui-rs!");
-                ui.text(format!("FPS: {:?}", ui.io().framerate));
+                ui.text(format!("FPS: {:?}", ui.io().framerate()));
                 ui.separator();
-                let mouse_pos = ui.io().mouse_pos;
+                let mouse_pos = ui.io().mouse_pos();
                 ui.text(format!(
                     "Mouse Position: ({:.1},{:.1})",
                     mouse_pos[0], mouse_pos[1]
@@ -869,8 +888,12 @@ impl App {
             }
         });
         self.scene_panel.draw(ui, self.scene.world_mut());
+        self.scene_panel.handle_input(ui);
+        self.scene_panel
+            .draw_gizmo(ui, &self.camera, self.scene.world_mut());
 
-        rcx.winit_platform.prepare_render(ui, &rcx.window);
+        rcx.winit_platform
+            .prepare_render(&mut rcx.imgui_context, &rcx.window);
         rcx.frame_submission.clear_all();
 
         self.scene.update();
@@ -972,7 +995,6 @@ impl App {
             swapchain_views: &rcx.swapchain_pass.attachment_image_views,
             viewport: &rcx.viewport,
             scissor: &rcx.scissor,
-            current_frame: rcx.current_frame,
             frame_descriptor_set: frame_descriptor_set.clone(),
         };
 
@@ -1058,6 +1080,8 @@ fn window_size_dependent_setup(
 
         let vertex_input_state = PositionMeshVertex::per_vertex().definition(&vs).unwrap();
 
+        let push_constant_ranges = [vs.info().push_constant_requirements.unwrap()];
+
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
             PipelineShaderStageCreateInfo::new(fs),
@@ -1069,21 +1093,13 @@ fn window_size_dependent_setup(
         };
 
         let layout = {
-            let mut set_layouts = renderer_set_0_layouts();
-            // Keep instancing same as MRT
-            let mut inst = DescriptorSetLayoutCreateInfo::default();
-            inst.bindings.insert(1, {
-                let mut b = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
-                b.stages = ShaderStages::VERTEX;
-                b
-            });
-            set_layouts.push(inst);
+            let set_layouts = renderer_set_0_layouts();
             PipelineLayout::new(
                 device.clone(),
                 PipelineDescriptorSetLayoutCreateInfo {
                     flags: Default::default(),
                     set_layouts,
-                    push_constant_ranges: vec![],
+                    push_constant_ranges: push_constant_ranges.into(),
                 }
                 .into_pipeline_layout_create_info(device.clone())
                 .unwrap(),
@@ -1138,6 +1154,8 @@ fn window_size_dependent_setup(
 
         let vertex_input_state = StandardMeshVertex::per_vertex().definition(&vs).unwrap();
 
+        let push_constant_ranges = [vs.info().push_constant_requirements.unwrap()];
+
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
             PipelineShaderStageCreateInfo::new(fs),
@@ -1162,27 +1180,22 @@ fn window_size_dependent_setup(
             tex_bind.descriptor_count = 2.max(256); // TODO! FIX!
             set_layout_1.bindings.insert(0, tex_bind);
 
-            /* binding 1: Transform SSBO */
-            let mut transform_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
-            transform_bind.stages = ShaderStages::VERTEX;
-            set_layout_1.bindings.insert(1, transform_bind);
-
-            /* binding 2: material_ids[] */
+            /* binding 1: material_ids[] */
             let mut matid_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
             matid_bind.stages = ShaderStages::VERTEX;
-            set_layout_1.bindings.insert(2, matid_bind);
+            set_layout_1.bindings.insert(1, matid_bind);
 
-            /* binding 3: GpuMaterial[] */
+            /* binding 2: GpuMaterial[] */
             let mut mat_bind = DescriptorSetLayoutBinding::descriptor_type(StorageBuffer);
             mat_bind.stages = ShaderStages::FRAGMENT;
-            set_layout_1.bindings.insert(3, mat_bind);
+            set_layout_1.bindings.insert(2, mat_bind);
 
             let mut set_layouts = renderer_set_0_layouts();
             set_layouts.push(set_layout_1);
             let infos = PipelineDescriptorSetLayoutCreateInfo {
                 flags: Default::default(),
                 set_layouts,
-                push_constant_ranges: vec![],
+                push_constant_ranges: push_constant_ranges.into(),
             };
             PipelineLayout::new(
                 device.clone(),
@@ -1750,15 +1763,4 @@ fn window_size_dependent_setup(
     // let (cull_compute_pass, cull_prefix_pass) = construct_culling_passes(&device);
 
     (swapchain_pass, mrt, mrt_lighting, composite, bloom_pass)
-}
-
-fn update_material_ids_for_mesh(mesh: &MeshAsset, material_ids: &mut [u32]) {
-    let mut draw_id = 0;
-
-    for _lod in 0..mesh.lods.len() {
-        for sub in &mesh.submeshes {
-            material_ids[draw_id] = sub.material_index;
-            draw_id += 1;
-        }
-    }
 }

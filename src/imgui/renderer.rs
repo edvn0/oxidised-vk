@@ -4,15 +4,18 @@ use crate::{
     mesh::ImageViewSampler,
 };
 
-use imgui::{DrawCmd, DrawData, FontConfig, FontSource};
-use std::{collections::BTreeMap, sync::Arc};
-
+use dear_imgui_rs::{Context, DrawCmd, DrawData, FontConfig, FontSource, TextureId};
+use std::sync::Arc;
 use vulkano::{
+    DeviceSize,
     buffer::{
         BufferContents, BufferUsage, Subbuffer,
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
     },
-    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer},
+    command_buffer::{
+        AutoCommandBufferBuilder, PrimaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
+    },
     descriptor_set::{
         DescriptorSet, WriteDescriptorSet,
         allocator::StandardDescriptorSetAllocator,
@@ -45,12 +48,15 @@ use vulkano::{
 use vulkano::pipeline::DynamicState;
 use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
 
+const ROBOTO_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Roboto-Regular.ttf");
+const ROBOTO_BLACK: &[u8] = include_bytes!("../../assets/fonts/Roboto-Black.ttf");
+
 #[repr(C)]
 #[derive(BufferContents, Copy, Clone)]
 pub struct OwnedDrawVert {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
-    pub col: [u8; 4],
+    pub col: u32,
 }
 
 pub struct ImGuiRenderer {
@@ -98,6 +104,12 @@ impl ImGuiRenderer {
             sampler_clamp.clone(),
         );
 
+        let typical_index_count = 6000;
+        let typical_index_size = (std::mem::size_of::<u32>() * typical_index_count) as DeviceSize;
+        let typical_vertex_count = 2500;
+        let typical_vertex_size =
+            (std::mem::size_of::<OwnedDrawVert>() * typical_vertex_count) as DeviceSize;
+
         let vtx_alloc = SubbufferAllocator::new(
             allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -106,7 +118,7 @@ impl ImGuiRenderer {
                     | BufferUsage::SHADER_DEVICE_ADDRESS,
                 memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS
                     | MemoryTypeFilter::PREFER_DEVICE,
-                arena_size: 1024 * 1024,
+                arena_size: typical_vertex_size,
                 ..Default::default()
             },
         );
@@ -117,7 +129,7 @@ impl ImGuiRenderer {
                 buffer_usage: BufferUsage::INDEX_BUFFER,
                 memory_type_filter: MemoryTypeFilter::HOST_RANDOM_ACCESS
                     | MemoryTypeFilter::PREFER_DEVICE,
-                arena_size: 512 * 1024,
+                arena_size: typical_index_size,
                 ..Default::default()
             },
         );
@@ -137,49 +149,44 @@ impl ImGuiRenderer {
 
     pub fn upload_font_atlas(
         &mut self,
-        imgui: &mut imgui::Context,
+        imgui: &mut Context,
         queue: Arc<Queue>,
-        cb_allocator: Arc<vulkano::command_buffer::allocator::StandardCommandBufferAllocator>,
+        cb_allocator: Arc<StandardCommandBufferAllocator>,
     ) {
-        const ROBOTO_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Roboto-Regular.ttf");
-        const ROBOTO_BLACK: &[u8] = include_bytes!("../../assets/fonts/Roboto-Black.ttf");
+        let mut atlas = imgui.font_atlas_mut();
 
-        let fonts = [
-            ("roboto_regular", ROBOTO_REGULAR),
-            ("roboto_black", ROBOTO_BLACK),
-        ];
+        let default_config = FontConfig::new().oversample_h(2).oversample_v(2);
 
-        let base_config = FontConfig {
-            oversample_h: 2,
-            oversample_v: 2,
-            pixel_snap_h: true,
-            rasterizer_multiply: 1.1,
-            glyph_offset: [0.0, 0.0],
-            ..Default::default()
-        };
-
-        let size_range = 8..=15;
-
-        let atlas = imgui.fonts();
-
-        for &(name, font_data) in &fonts {
-            for size in size_range.clone() {
-                atlas.add_font(&[FontSource::TtfData {
-                    data: font_data,
-                    size_pixels: size as f32,
-                    config: Some(FontConfig {
-                        name: Some(name.to_string()),
-                        ..base_config.clone()
-                    }),
-                }]);
-            }
+        for size in 15..=7 {
+            atlas.add_font(
+                &[
+                    FontSource::ttf_data_with_size(ROBOTO_REGULAR, size as f32).with_config(
+                        default_config
+                            .clone()
+                            .name(&format!("Roboto-Regular-{}", size)),
+                    ),
+                ],
+            );
+            atlas.add_font(&[FontSource::ttf_data_with_size(ROBOTO_BLACK, size as f32)
+                .with_config(
+                    default_config
+                        .clone()
+                        .name(&format!("Roboto-Black-{}", size)),
+                )]);
         }
 
-        let fonts = imgui.fonts();
-        let atlas = fonts.build_rgba32_texture();
+        assert!(atlas.build(), "Font atlas build failed");
+
+        let (pixels, width, height) = unsafe {
+            let (ptr, w, h) = atlas
+                .get_tex_data_ptr()
+                .expect("Font atlas has no texture data");
+            let slice = std::slice::from_raw_parts(ptr, (w * h * 4) as usize);
+            (slice, w, h)
+        };
 
         let image_info = ImageInfo::new(
-            ImageDimensions::Dim2d([atlas.width as u32, atlas.height as u32]),
+            ImageDimensions::Dim2d([width, height]),
             Format::R8G8B8A8_UNORM,
             None,
             "ImGui Font Atlas".into(),
@@ -187,15 +194,16 @@ impl ImGuiRenderer {
         );
 
         let image = create_image(
-            queue,
-            cb_allocator,
+            queue.clone(),
+            cb_allocator.clone(),
             self.allocator.clone(),
-            &atlas.data,
+            pixels,
             image_info,
         );
 
+        // Register + assign texture to ImGui
         let id = self.register_texture(image);
-        fonts.tex_id = imgui::TextureId::from(id);
+        atlas.set_texture_id(TextureId::new(id as u64));
     }
 
     pub fn draw(
@@ -263,7 +271,12 @@ impl ImGuiRenderer {
 
         for list in draw_data.draw_lists() {
             for cmd_i in list.commands() {
-                let DrawCmd::Elements { count, cmd_params } = cmd_i else {
+                let DrawCmd::Elements {
+                    cmd_params,
+                    count,
+                    raw_cmd: _raw_cmd,
+                } = cmd_i
+                else {
                     continue;
                 };
 
@@ -355,7 +368,7 @@ impl ImGuiRenderer {
             device.clone(),
             DescriptorSetLayoutCreateInfo {
                 flags: DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
-                bindings: BTreeMap::from([
+                bindings: [
                     (0, {
                         let mut b = DescriptorSetLayoutBinding::descriptor_type(
                             DescriptorType::SampledImage,
@@ -373,7 +386,9 @@ impl ImGuiRenderer {
                         b.immutable_samplers = vec![sampler_clamp];
                         b
                     }),
-                ]),
+                ]
+                .into_iter()
+                .collect(),
                 ..Default::default()
             },
         )

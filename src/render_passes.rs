@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use dear_imgui_rs as imgui;
 use vulkano::{
     Validated, ValidationError, VulkanError,
     command_buffer::{
@@ -24,11 +25,12 @@ use vulkano::{
 use crate::{
     imgui::renderer::ImGuiRenderer,
     mesh::ImageViewSampler,
-    mesh_registry::MeshHandle,
     render_context::{Culling, MeshDrawStream, Winding},
 };
 
 pub mod data {
+    use crate::mesh_registry::RenderStreamKey;
+
     use super::*;
 
     pub struct FrameContext<'a> {
@@ -40,13 +42,12 @@ pub mod data {
     }
 
     pub struct RenderResources<'a> {
-        pub mesh_streams: &'a HashMap<MeshHandle, MeshDrawStream>,
+        pub mesh_streams: &'a HashMap<RenderStreamKey, MeshDrawStream>,
         pub descriptor_sets: &'a Arc<StandardDescriptorSetAllocator>,
         pub white_sampler: &'a ImageViewSampler,
         pub swapchain_views: &'a [Arc<ImageView>],
         pub viewport: &'a Viewport,
         pub scissor: &'a Scissor,
-        pub current_frame: usize,
         pub frame_descriptor_set: Arc<DescriptorSet>,
     }
 
@@ -132,9 +133,7 @@ pub mod passes {
                 recorder.cmd,
                 res.viewport,
                 res.scissor,
-                res.current_frame,
                 res.frame_descriptor_set.clone(),
-                res.descriptor_sets,
                 res.mesh_streams,
                 frame.culling,
                 frame.winding,
@@ -161,7 +160,6 @@ pub mod passes {
                 res.frame_descriptor_set.clone(),
                 res.mesh_streams,
                 res.white_sampler,
-                res.current_frame,
                 frame.culling,
                 frame.winding,
             )
@@ -306,6 +304,7 @@ pub mod recordings {
 
     use crate::{
         engine_shaders,
+        mesh_registry::RenderStreamKey,
         render_passes::data::{RenderPassError, RenderPassResult},
     };
 
@@ -363,10 +362,8 @@ pub mod recordings {
             builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
             viewport: &Viewport,
             scissor: &Scissor,
-            current_frame: usize,
             frame_descriptor_set: Arc<DescriptorSet>,
-            descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-            mesh_streams: &HashMap<MeshHandle, MeshDrawStream>,
+            mesh_streams: &HashMap<RenderStreamKey, MeshDrawStream>,
             culling: Culling,
             winding: Winding,
         ) -> RenderPassResult<()> {
@@ -403,32 +400,20 @@ pub mod recordings {
                     [frame_descriptor_set].to_vec(),
                 )?;
 
-            let layout = self.predepth_pipeline.layout().set_layouts()[1].clone();
-
             for stream in mesh_streams.values() {
-                let set_1 = DescriptorSet::new(
-                    descriptor_set_allocator.clone(),
-                    layout.clone(),
-                    [WriteDescriptorSet::buffer(
-                        1,
-                        stream.transforms[current_frame].clone(),
-                    )],
-                    [],
-                )
-                .map_err(RenderPassError::DescriptorSetCreation)?;
+                let transform_vba = stream.transforms.device_address().unwrap();
 
                 builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
+                    .push_constants(
                         self.predepth_pipeline.layout().clone(),
-                        1,
-                        [set_1].to_vec(),
+                        0,
+                        transform_vba.get(),
                     )?
                     .bind_vertex_buffers(0, stream.mesh.position_vertex_buffer.clone())?
                     .bind_index_buffer(stream.mesh.index_buffer.clone())?;
 
                 unsafe {
-                    builder.draw_indexed_indirect(stream.indirect[current_frame].clone())?;
+                    builder.draw_indexed_indirect(stream.indirect.clone())?;
                 }
             }
 
@@ -447,9 +432,8 @@ pub mod recordings {
             viewport: &Viewport,
             descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
             descriptor_set: Arc<DescriptorSet>,
-            mesh_streams: &HashMap<MeshHandle, MeshDrawStream>,
+            mesh_streams: &HashMap<RenderStreamKey, MeshDrawStream>,
             white_sampler: &ImageViewSampler,
-            current_frame: usize,
             culling: Culling,
             winding: Winding,
         ) -> RenderPassResult<()> {
@@ -519,13 +503,16 @@ pub mod recordings {
                                 )))
                                 .take(256),
                         ),
-                        WriteDescriptorSet::buffer(1, stream.transforms[current_frame].clone()),
-                        WriteDescriptorSet::buffer(2, stream.material_ids[current_frame].clone()),
-                        WriteDescriptorSet::buffer(3, stream.mesh.materials_buffer.clone()),
+                        WriteDescriptorSet::buffer(1, stream.material_ids.clone()),
+                        WriteDescriptorSet::buffer(2, stream.mesh.materials_buffer.clone()),
                     ],
                     [],
                 )
                 .map_err(RenderPassError::DescriptorSetCreation)?;
+
+                let transforms = stream.transforms.device_address().unwrap().get();
+                let material_ids = stream.material_ids.device_address().unwrap().get();
+                let mesh_materials = stream.mesh.materials_buffer.device_address().unwrap().get();
 
                 builder
                     .bind_descriptor_sets(
@@ -534,11 +521,16 @@ pub mod recordings {
                         1,
                         [set_1].to_vec(),
                     )?
+                    .push_constants(
+                        self.gbuffer_instanced_pipeline.layout().clone(),
+                        0,
+                        [transforms, material_ids, mesh_materials],
+                    )?
                     .bind_vertex_buffers(0, stream.mesh.vertex_buffer.clone())?
                     .bind_index_buffer(stream.mesh.index_buffer.clone())?;
 
                 unsafe {
-                    builder.draw_indexed_indirect(stream.indirect[current_frame].clone())?;
+                    builder.draw_indexed_indirect(stream.indirect.clone())?;
                 }
             }
 

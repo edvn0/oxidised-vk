@@ -1,5 +1,6 @@
 #version 460
-#extension GL_EXT_nonuniform_qualifier : enable
+#include "preamble.glsl"
+#include "buffers.glsl"
 
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in vec2 v_uvs;
@@ -10,16 +11,18 @@ layout(location = 1) out vec4 uvs_mrt;
 layout(location = 2) out vec4 albedo_mrt;
 layout(location = 3) out uint material_id;
 
-#include "material.glsl"
+layout(set = 1, binding = 0) uniform sampler2D textures[];
+layout(set = 1, binding = 1) uniform sampler samplers[];
 
-layout(set = 1, binding = 0) uniform sampler2D textures[256];
-
-layout(set = 1, binding = 3, std430) readonly buffer Materials {
-    GpuMaterial materials[];
+layout(push_constant) uniform PC {
+    Transforms transforms;
+    MaterialIds material_ids;
+    Materials mesh_materials;
 };
 
+
 void main() {
-    GpuMaterial mat = materials[v_material_id];
+    GpuMaterial mat = mesh_materials.materials[v_material_id];
 
     uint tex_index = mat.base_color_tex;
 

@@ -1,4 +1,5 @@
 use crate::{bloom_pass::BloomSettings, render_passes::recordings::CompositeSettings};
+use dear_imgui_rs as imgui;
 
 impl BloomSettings {
     pub fn ui(&mut self, ui: &imgui::Ui) {

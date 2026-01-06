@@ -10,6 +10,7 @@ pub struct InputState {
     pub up: bool,
     pub down: bool,
 
+    pub suppress_mouse: bool,
     pub rotating: bool,
     pub mouse_delta: (f32, f32),
     pub last_mouse_pos: Option<(f32, f32)>,
@@ -24,6 +25,7 @@ impl InputState {
             right: false,
             up: false,
             down: false,
+            suppress_mouse: false,
             rotating: false,
             mouse_delta: (0.0, 0.0),
             last_mouse_pos: None,
@@ -54,8 +56,10 @@ impl InputState {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Right {
-                    self.rotating = *state == ElementState::Pressed;
-                    if !self.rotating {
+                    if *state == ElementState::Pressed && !self.suppress_mouse {
+                        self.rotating = true;
+                    } else {
+                        self.rotating = false;
                         self.last_mouse_pos = None;
                     }
                 }

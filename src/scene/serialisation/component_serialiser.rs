@@ -66,6 +66,7 @@ mod serialiser_implementations {
         components::{self, MeshComponent, Transform},
         mesh_registry::MeshHandle,
         scene::serialisation::{SerializableComponent, deserialize_pod, serialize_pod},
+        submission::SubmeshSelection,
     };
     use std::io::{Read, Write};
 
@@ -114,15 +115,52 @@ mod serialiser_implementations {
         }
     }
 
+    #[repr(u32)]
+    enum SubmeshSelectionTag {
+        All = 0,
+        One = 1,
+    }
+
     impl SerializableComponent for MeshComponent {
         fn serialize(&self, writer: &mut dyn Write) -> std::io::Result<()> {
-            serialize_pod::<u32>(&self.mesh.0, writer)
+            serialize_pod::<u32>(&self.mesh.0, writer)?;
+
+            match self.submeshes {
+                SubmeshSelection::All => {
+                    let tag = SubmeshSelectionTag::All as u32;
+                    serialize_pod::<u32>(&tag, writer)?;
+                }
+                SubmeshSelection::One(i) => {
+                    let tag = SubmeshSelectionTag::One as u32;
+                    serialize_pod::<u32>(&tag, writer)?;
+                    serialize_pod::<u32>(&i, writer)?;
+                }
+            }
+
+            Ok(())
         }
 
         fn deserialize(reader: &mut dyn Read) -> std::io::Result<Self> {
             let mesh_id = deserialize_pod::<u32>(reader)?;
+            let tag = deserialize_pod::<u32>(reader)?;
+
+            let submeshes = match tag {
+                x if x == SubmeshSelectionTag::All as u32 => SubmeshSelection::All,
+                x if x == SubmeshSelectionTag::One as u32 => {
+                    let index = deserialize_pod::<u32>(reader)?;
+                    SubmeshSelection::One(index)
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid SubmeshSelection tag",
+                    ));
+                }
+            };
+
             Ok(Self {
                 mesh: MeshHandle(mesh_id),
+                submeshes,
             })
         }
 

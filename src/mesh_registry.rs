@@ -1,10 +1,16 @@
-use crate::mesh::MeshAsset;
+use crate::mesh::{MaterialClass, MeshAsset};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct MeshHandle(pub u32);
+
+#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
+pub struct RenderStreamKey {
+    pub mesh: MeshHandle,
+    pub material_class: MaterialClass,
+}
 
 pub struct MeshRegistry {
     meshes: Vec<Arc<MeshAsset>>,
@@ -34,8 +40,10 @@ impl MeshRegistry {
         self.name_to_handle.get(name).copied()
     }
 
-    pub fn get(&self, handle: MeshHandle) -> &Arc<MeshAsset> {
-        &self.meshes[handle.0 as usize]
+    pub fn get(&self, handle: MeshHandle) -> Result<&Arc<MeshAsset>, String> {
+        self.meshes
+            .get(handle.0 as usize)
+            .ok_or_else(|| format!("Mesh handle {} is invalid", handle.0))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (MeshHandle, &Arc<MeshAsset>)> {

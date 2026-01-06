@@ -1,4 +1,6 @@
 #version 460
+#include "preamble.glsl"
+#include "buffers.glsl"
 
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 uvs;
@@ -8,6 +10,8 @@ layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec2 v_uvs;
 layout(location = 2) flat out uint v_material_id;
 
+#include "material.glsl"
+
 layout(set = 0, binding = 0, std140) uniform UBO {
     mat4 view;
     mat4 projection;
@@ -15,21 +19,19 @@ layout(set = 0, binding = 0, std140) uniform UBO {
     vec4 sun_direction;
 };
 
-layout(set = 1, binding = 1, std430) readonly buffer Transforms {
-    mat4 transforms[];
-};
-
-layout(set = 1, binding = 2, std430) readonly buffer MaterialIds {
-    uint material_ids[];
+layout(push_constant) uniform PC {
+    Transforms transforms;
+    MaterialIds material_ids;
+    Materials mesh_materials;
 };
 
 void main() {
     uint draw_id = gl_DrawID;
     uint object_index = gl_InstanceIndex + gl_BaseInstance;
 
-    uint material_index =material_ids[draw_id];
+    uint material_index = material_ids.mi[draw_id];
 
-    mat4 model = transforms[object_index];
+    mat4 model = transforms.ts[object_index].model;
 
     v_material_id = material_index;
 

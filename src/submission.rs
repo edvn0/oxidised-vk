@@ -1,8 +1,15 @@
 use crate::TransformTRS;
 use crate::mesh_registry::MeshHandle;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubmeshSelection {
+    All,
+    One(u32),
+}
+
 pub struct DrawSubmission {
     pub mesh: MeshHandle,
+    pub submesh: SubmeshSelection,
     pub transform: TransformTRS,
     pub override_material: Option<u32>,
 }

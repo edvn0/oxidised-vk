@@ -1,4 +1,6 @@
-#version 450
+#version 460
+#include "preamble.glsl"
+
 layout(location = 0) in vec2 v_uvs;
 
 layout(set = 0, binding = 0) uniform UBO {

@@ -1,10 +1,11 @@
 pub mod vs {
     vulkano_shaders::shader! {
-            ty: "vertex",
-            vulkan_version: "1.3",
-            spirv_version: "1.6",
-            src: r#"
+                ty: "vertex",
+                vulkan_version: "1.3",
+                spirv_version: "1.6",
+                src: r#"
 #version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
 
 layout(location = 0) out vec4 out_color;
@@ -21,10 +22,10 @@ layout(buffer_reference, std430) readonly buffer VB {
 };
 
 layout(push_constant, std430) uniform PC {
-    vec4 lrtb;
-    VB vb;
-    uint texture_index;
-    uint _pad;
+    layout(offset = 0)  vec4 lrtb;
+    layout(offset = 16) VB vb;
+    layout(offset = 24) uint texture_index;
+    layout(offset = 28) uint _pad;
 } pc;
 
 void main() {
@@ -49,8 +50,8 @@ void main() {
 
 pub mod fs {
     vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r#"
+                                        ty: "fragment",
+                                        src: r#"
 #version 460
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -62,10 +63,11 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform texture2D Textures[];
 layout(set = 0, binding = 1) uniform sampler ImmutableSampler;
 
-layout(push_constant) uniform PC {
-    vec4 lrtb;
-    uint64_t vb;
-    uint texture_index;
+layout(push_constant, std430) uniform PC {
+    layout(offset = 0)  vec4 lrtb;
+    layout(offset = 16) uint64_t vb;
+    layout(offset = 24) uint texture_index;
+    layout(offset = 28) uint _pad;
 } pc;
 
 void main()
