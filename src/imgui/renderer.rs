@@ -5,6 +5,7 @@ use crate::{
 };
 
 use dear_imgui_rs::{Context, DrawCmd, DrawData, FontConfig, FontSource, TextureId};
+use std::collections::HashMap;
 use std::sync::Arc;
 use vulkano::{
     DeviceSize,
@@ -26,9 +27,14 @@ use vulkano::{
     },
     device::{Device, Queue},
     format::Format,
-    image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
+    image::{
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
+        view::ImageView,
+    },
     memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
+        DynamicState,
+        DynamicState::{DepthTestEnable, DepthWriteEnable},
         GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
         graphics::{
             GraphicsPipelineCreateInfo,
@@ -44,9 +50,6 @@ use vulkano::{
     },
     shader::ShaderStages,
 };
-
-use vulkano::pipeline::DynamicState;
-use vulkano::pipeline::DynamicState::{DepthTestEnable, DepthWriteEnable};
 
 const ROBOTO_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Roboto-Regular.ttf");
 const ROBOTO_BLACK: &[u8] = include_bytes!("../../assets/fonts/Roboto-Black.ttf");
@@ -66,7 +69,8 @@ pub struct ImGuiRenderer {
     pipeline: Arc<GraphicsPipeline>,
     texture_set: Arc<DescriptorSet>,
 
-    textures: Vec<Option<Arc<ImageViewSampler>>>,
+    textures: Vec<Option<Arc<ImageView>>>,
+    texture_lookup: HashMap<usize, usize>,
     free_texture_ids: Vec<usize>,
 
     sampler_clamp: Arc<Sampler>,
@@ -140,6 +144,7 @@ impl ImGuiRenderer {
             pipeline,
             texture_set,
             textures: Vec::new(),
+            texture_lookup: HashMap::new(),
             free_texture_ids: Vec::new(),
             sampler_clamp,
             vtx_alloc,
@@ -167,6 +172,7 @@ impl ImGuiRenderer {
                     ),
                 ],
             );
+
             atlas.add_font(&[FontSource::ttf_data_with_size(ROBOTO_BLACK, size as f32)
                 .with_config(
                     default_config
@@ -201,9 +207,39 @@ impl ImGuiRenderer {
             image_info,
         );
 
-        // Register + assign texture to ImGui
-        let id = self.register_texture(image);
-        atlas.set_texture_id(TextureId::new(id as u64));
+        let tex_id = self.texture_id(&image.view);
+        atlas.set_texture_id(tex_id);
+    }
+
+    pub fn clear_textures(&mut self) {
+        self.textures.clear();
+        self.texture_lookup.clear();
+        self.free_texture_ids.clear();
+        self.rebuild_texture_set();
+    }
+
+    pub fn texture_id(&mut self, tex: &Arc<ImageView>) -> TextureId {
+        let key = Arc::as_ptr(tex) as usize;
+
+        if let Some(&id) = self.texture_lookup.get(&key) {
+            return TextureId::new(id as u64);
+        }
+
+        let id = self.free_texture_ids.pop().unwrap_or_else(|| {
+            let id = self.textures.len();
+            self.textures.push(None);
+            id
+        });
+
+        self.textures[id] = Some(tex.clone());
+        self.texture_lookup.insert(key, id);
+        self.rebuild_texture_set();
+
+        TextureId::new(id as u64)
+    }
+
+    pub fn register_texture(&mut self, tex: Arc<ImageView>) -> TextureId {
+        self.texture_id(&tex)
     }
 
     pub fn draw(
@@ -324,7 +360,7 @@ impl ImGuiRenderer {
             .enumerate()
             .filter_map(|(i, tex)| {
                 tex.as_ref()
-                    .map(|t| WriteDescriptorSet::image_view_array(0, i as u32, [t.view.clone()]))
+                    .map(|t| WriteDescriptorSet::image_view_array(0, i as u32, [t.clone()]))
             })
             .collect::<Vec<_>>();
 
@@ -335,18 +371,6 @@ impl ImGuiRenderer {
             [],
         )
         .unwrap();
-    }
-
-    fn register_texture(&mut self, tex: Arc<ImageViewSampler>) -> usize {
-        let id = self.free_texture_ids.pop().unwrap_or_else(|| {
-            let id = self.textures.len();
-            self.textures.push(None);
-            id
-        });
-
-        self.textures[id] = Some(tex);
-        self.rebuild_texture_set();
-        id
     }
 
     fn create_pipeline(

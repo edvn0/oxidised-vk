@@ -5,10 +5,14 @@
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 uvs;
 layout(location = 2) in vec3 normal;
+layout(location = 3) in vec3 tangent;
+layout(location = 4) in vec3 bitangent;
 
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec2 v_uvs;
-layout(location = 2) flat out uint v_material_id;
+layout(location = 2) out vec3 v_tangent;
+layout(location = 3) out vec3 v_bitangent;
+layout(location = 4) flat out uint v_material_id;
 
 #include "material.glsl"
 
@@ -41,8 +45,16 @@ void main() {
     vec4 world_pos = model * vec4(position, 1.0);
     vec4 view_pos = view * world_pos;
 
-    v_normal = normalize(( view * vec4(world_norm, 0.0) ) . xyz);
     v_uvs = uvs;
+
+    vec3 N = normalize(normal_mat * normal);
+    vec3 T = normalize(normal_mat * tangent);
+    vec3 B = normalize(normal_mat * bitangent);
+
+    mat3 view_mat = mat3(view);
+    v_normal    = normalize(view_mat * N);
+    v_tangent   = normalize(view_mat * T);
+    v_bitangent = normalize(view_mat * B);
 
     gl_Position = projection * view_pos;
 }

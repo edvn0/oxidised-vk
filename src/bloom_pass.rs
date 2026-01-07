@@ -50,6 +50,10 @@ pub mod bloom_limits {
     pub const INTENSITY_MAX: f32 = 3.0;
     pub const INTENSITY_DEFAULT: f32 = 1.0;
 
+    pub const KNEE_MIN: f32 = 0.0;
+    pub const KNEE_MAX: f32 = 1.0;
+    pub const KNEE_DEFAULT: f32 = 0.5;
+
     pub const FILTER_RADIUS_MIN: f32 = 0.0005;
     pub const FILTER_RADIUS_MAX: f32 = 0.02;
     pub const FILTER_RADIUS_DEFAULT: f32 = 0.005;
@@ -57,6 +61,7 @@ pub mod bloom_limits {
 
 pub struct BloomSettings {
     pub threshold: f32,
+    pub knee: f32,
     pub intensity: f32,
     pub filter_radius: f32,
     pub enabled: bool,
@@ -66,6 +71,7 @@ impl Default for BloomSettings {
     fn default() -> Self {
         Self {
             threshold: bloom_limits::THRESHOLD_DEFAULT,
+            knee: bloom_limits::KNEE_DEFAULT,
             intensity: bloom_limits::INTENSITY_DEFAULT,
             filter_radius: bloom_limits::FILTER_RADIUS_DEFAULT,
             enabled: true,
@@ -222,6 +228,7 @@ impl BloomPass {
 
                     layout(push_constant) uniform Push {
                         float threshold;
+                        float knee;
                     } pc;
 
                     void main() {
@@ -229,11 +236,19 @@ impl BloomPass {
                         ivec2 size = imageSize(bloom_out);
                         if (uv.x >= size.x || uv.y >= size.y) return;
 
-                        vec4 c = imageLoad(hdr_in, uv);
-                        float l = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
-                        vec4 result = l > pc.threshold ? c : vec4(0.0);
-                        result = max(result, 0.0001); // Prevent black artifacts
-                        imageStore(bloom_out, uv, result);
+                        vec3 c = imageLoad(hdr_in, uv).rgb;
+                        float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+
+                        float t = pc.threshold;
+                        float k = max(pc.knee * t, 1e-5);
+
+                        // Soft knee bloom curve
+                        float soft = clamp((l - t + k) / (2.0 * k), 0.0, 1.0);
+                        float weight = max(l - t, 0.0) / max(l, 1e-5);
+                        weight = max(weight, soft * soft);
+
+                        vec3 result = c * weight;
+                        imageStore(bloom_out, uv, vec4(max(result, vec3(0.0)), 1.0));
                     }
                 "
             }
@@ -364,7 +379,7 @@ impl BloomPass {
 
         // Build extract stage
         let (extract_layout, extract_pipe_layout) =
-            make_storage_layout(device.clone(), std::mem::size_of::<f32>() as u32);
+            make_storage_layout(device.clone(), std::mem::size_of::<[f32; 2]>() as u32);
         let extract_pipeline = ComputePipeline::new(
             device.clone(),
             None,
@@ -461,6 +476,10 @@ impl BloomPass {
             bloom_limits::FILTER_RADIUS_MAX,
         );
 
+        let knee = settings
+            .knee
+            .clamp(bloom_limits::KNEE_MIN, bloom_limits::KNEE_MAX);
+
         builder
             .begin_debug_utils_label(DebugUtilsLabel {
                 label_name: "Bloom".to_string(),
@@ -484,7 +503,7 @@ impl BloomPass {
         builder
             .bind_pipeline_compute(self.extract.pipeline.clone())
             .unwrap()
-            .push_constants(self.extract.pipeline.layout().clone(), 0, threshold)
+            .push_constants(self.extract.pipeline.layout().clone(), 0, [threshold, knee])
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,

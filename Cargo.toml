@@ -23,7 +23,7 @@ legion = "0.4.0"
 gltf = "1.4.1"
 
 # ImGui ecosystem
-dear-imgui-rs = "0.8.0"
+dear-imgui-rs = {version="0.8.0", features=["multi-viewport"]}
 dear-imgui-winit = "0.8.0"
 dear-imguizmo = "0.8.0"
 

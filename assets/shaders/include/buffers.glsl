@@ -1,7 +1,6 @@
 #ifndef BUFFERS_GLSL
 #define BUFFERS_GLSL
 
-
 struct Transform {
     mat4 model;
 };

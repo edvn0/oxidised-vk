@@ -1,3 +1,4 @@
+use crate::aabb::Aabb;
 use crate::mesh_registry::MeshRegistry;
 use crate::texture_cache::{BindlessTextureIndex, TextureCache};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
@@ -47,41 +48,39 @@ impl From<std::io::Error> for MeshLoadError {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(BufferContents, Clone, Copy, Default)]
 pub struct GpuMaterial {
     pub base_color: [f32; 4],
 
-    pub metallic: f32,
-    pub roughness: f32,
     pub base_color_tex: u32,
     pub normal_tex: u32,
-
     pub metallic_roughness_tex: u32,
     pub ao_tex: u32,
-    pub _padding: [f32; 2],
-
+    pub emissive_tex: u32,
     pub flags: u32,
 
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub ao: f32,
+    pub emissive: f32,
+    pub alpha_cutoff: f32,
+
+    pub _pad: [u32; 4],
 }
-pub mod material_feature_flags {
-    pub const HAS_BASE_COLOR_TEX: u32 = 1 << 0;
-    pub const HAS_NORMAL_TEX: u32 = 1 << 1;
-    pub const HAS_METALLIC_ROUGHNESS_TEX: u32 = 1 << 2;
-    pub const HAS_AO_TEX: u32 = 1 << 3;
+const MATERIAL_SIZE_CHECK: () = {
+    if std::mem::size_of::<GpuMaterial>() != 80 {
+        panic!("GpuMaterial size mismatch");
+    }
+};
+// Material flags (bitfield)
+pub mod material_flags {
+    pub const DOUBLE_SIDED: u32 = 1 << 0;
+    pub const ALPHA_BLEND: u32 = 1 << 1;
+    pub const ALPHA_TEST: u32 = 1 << 2;
+    pub const UNLIT: u32 = 1 << 3;
+    pub const CAST_SHADOWS: u32 = 1 << 4;
 }
-pub mod material_behavior_flags {
-    pub const TRANSPARENT: u32 = 1 << 16;
-    pub const ALPHA_TEST: u32 = 1 << 17;
-    pub const DOUBLE_SIDED: u32 = 1 << 18;
-    pub const CASTS_SHADOWS: u32 = 1 << 19;
-}
-pub const MATERIAL_FLAG_TRANSPARENT: u32 = material_behavior_flags::TRANSPARENT;
-pub const MATERIAL_FLAG_ALPHA_TEST: u32 = material_behavior_flags::ALPHA_TEST;
-pub const MATERIAL_FLAG_DOUBLE_SIDED: u32 = material_behavior_flags::DOUBLE_SIDED;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum MaterialClass {
@@ -92,9 +91,9 @@ pub enum MaterialClass {
 
 impl GpuMaterial {
     pub fn material_class(&self) -> MaterialClass {
-        if (self.flags & material_behavior_flags::TRANSPARENT) != 0 {
+        if (self.flags & material_flags::DOUBLE_SIDED) != 0 {
             MaterialClass::Transparent
-        } else if (self.flags & material_behavior_flags::ALPHA_TEST) != 0 {
+        } else if (self.flags & material_flags::ALPHA_TEST) != 0 {
             MaterialClass::AlphaTest
         } else {
             MaterialClass::Opaque
@@ -114,7 +113,7 @@ impl ImageViewSampler {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Clone)]
 pub struct MeshAsset {
     pub vertex_buffer: Subbuffer<[StandardMeshVertex]>,
     pub position_vertex_buffer: Subbuffer<[PositionMeshVertex]>,
@@ -122,16 +121,18 @@ pub struct MeshAsset {
 
     pub submeshes: Vec<SubmeshGpu>,
     pub lods: Vec<MeshLod>,
+    pub aabb: Aabb,
 
     pub materials_buffer: Subbuffer<[GpuMaterial]>,
     pub texture_array: Vec<Arc<ImageViewSampler>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy)]
 pub struct SubmeshGpu {
     pub first_index: u32,
     pub index_count: u32,
     pub material_index: u32,
+    pub aabb: Aabb,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,60 +147,30 @@ pub struct BuildMesh {
     pub lod_indices: Vec<Vec<u32>>,
     pub submeshes: Vec<SubmeshCpu>,
     pub materials: Vec<MaterialAsset>,
+    pub aabb: Aabb,
 }
 
 pub struct SubmeshCpu {
     pub first_index: u32,
     pub index_count: u32,
     pub material_index: u32,
+    pub aabb: Aabb,
 }
 
 pub struct MaterialAsset {
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
+    pub ao_factor: f32,
+    pub emissive_factor: f32,
 
     pub base_colour_tex: BindlessTextureIndex,
     pub normal_tex: BindlessTextureIndex,
     pub metallic_roughness_tex: BindlessTextureIndex,
     pub ao_tex: BindlessTextureIndex,
+    pub emissive_tex: BindlessTextureIndex,
 
     pub flags: u32,
-}
-
-impl MaterialAsset {
-    pub fn new(
-        base_color: [f32; 3],
-        metallic: f32,
-        roughness: f32,
-        base_colour_tex: BindlessTextureIndex,
-        normal_tex: BindlessTextureIndex,
-        metallic_roughness_tex: BindlessTextureIndex,
-        ao_tex: BindlessTextureIndex,
-        behavior_flags: u32,
-    ) -> Self {
-        let has = |t: BindlessTextureIndex| (t.raw() != DEFAULT_TEXTURE_WHITE) as u32;
-
-        let mut flags = 0u32;
-
-        flags |= has(base_colour_tex) * material_feature_flags::HAS_BASE_COLOR_TEX;
-        flags |= has(normal_tex) * material_feature_flags::HAS_NORMAL_TEX;
-        flags |= has(metallic_roughness_tex) * material_feature_flags::HAS_METALLIC_ROUGHNESS_TEX;
-        flags |= has(ao_tex) * material_feature_flags::HAS_AO_TEX;
-
-        flags |= behavior_flags;
-
-        Self {
-            base_color,
-            metallic,
-            roughness,
-            base_colour_tex,
-            normal_tex,
-            metallic_roughness_tex,
-            ao_tex,
-            flags,
-        }
-    }
 }
 
 pub fn upload_build_mesh(
@@ -288,7 +259,11 @@ pub fn upload_build_mesh(
             metallic_roughness_tex: DEFAULT_TEXTURE_WHITE,
             ao_tex: DEFAULT_TEXTURE_WHITE,
             flags: 0,
-            ..Default::default()
+            emissive_tex: DEFAULT_TEXTURE_WHITE,
+            ao: 1.0,
+            emissive: 0.0 / 3.0,
+            alpha_cutoff: 0.9,
+            _pad: [0; 4],
         });
     } else {
         gpu_materials.extend(build.materials.iter().map(|m| GpuMaterial {
@@ -300,7 +275,11 @@ pub fn upload_build_mesh(
             metallic_roughness_tex: m.metallic_roughness_tex.raw(),
             ao_tex: m.ao_tex.raw(),
             flags: m.flags,
-            ..Default::default()
+            emissive_tex: m.emissive_tex.raw(),
+            ao: m.ao_factor,
+            emissive: m.emissive_factor,
+            alpha_cutoff: 0.9,
+            _pad: [0; 4],
         }));
     }
 
@@ -331,6 +310,7 @@ pub fn upload_build_mesh(
                 first_index: s.first_index,
                 index_count: s.index_count,
                 material_index: s.material_index,
+                aabb: s.aabb,
             })
             .collect(),
 
@@ -338,6 +318,7 @@ pub fn upload_build_mesh(
 
         texture_array,
         materials_buffer,
+        aabb: build.aabb,
     }))
 }
 
@@ -375,6 +356,8 @@ pub fn import_gltf(
 
     let identity = Matrix4::<f32>::identity();
 
+    let mut bounds = Aabb::empty();
+
     for scene in gltf.scenes() {
         for node in scene.nodes() {
             process_node(
@@ -383,6 +366,7 @@ pub fn import_gltf(
                 &mut vertices,
                 &mut indices,
                 &mut submeshes,
+                &mut bounds,
                 &buffers,
             )?;
         }
@@ -396,6 +380,7 @@ pub fn import_gltf(
             lod_indices: lods,
             submeshes,
             materials,
+            aabb: bounds,
         },
         texture_array,
     ))
@@ -404,40 +389,39 @@ pub fn import_gltf(
 const DEFAULT_TEXTURE_WHITE: u32 = 0; // This is the white texture
 
 fn build_gltf_material_cpu(material: &gltf::Material, cache: &TextureCache) -> MaterialAsset {
-    let pbr = material.pbr_metallic_roughness();
-
-    let mut behaviour = 0u32;
-
+    // Build flags
+    let mut flags = material_flags::CAST_SHADOWS;
     if material.double_sided() {
-        behaviour |= material_behavior_flags::DOUBLE_SIDED;
+        flags |= material_flags::DOUBLE_SIDED;
+    }
+    if material.alpha_mode() == gltf::material::AlphaMode::Blend {
+        flags |= material_flags::ALPHA_BLEND;
+    }
+    if material.alpha_mode() == gltf::material::AlphaMode::Mask {
+        flags |= material_flags::ALPHA_TEST;
     }
 
-    match material.alpha_mode() {
-        gltf::material::AlphaMode::Opaque => {}
-        gltf::material::AlphaMode::Mask => {
-            behaviour |= material_behavior_flags::ALPHA_TEST;
-        }
-        gltf::material::AlphaMode::Blend => {
-            behaviour |= material_behavior_flags::TRANSPARENT;
-        }
-    }
+    let pbr = material.pbr_metallic_roughness();
+    //if pbr.unlit*() {
+    //    flags |= material_flags::UNLIT;
+    //}
 
-    // For now!
-    let shadows = true;
-    if shadows {
-        behaviour |= material_behavior_flags::CASTS_SHADOWS;
+    MaterialAsset {
+        base_color: pbr.base_color_factor()[0..3].try_into().unwrap(),
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        ao_factor: material
+            .occlusion_texture()
+            .map(|x| x.strength())
+            .unwrap_or(1.0),
+        emissive_factor: material.emissive_factor().iter().sum::<f32>() / 3.0, // TODO: Should use the full emissive factor later on
+        base_colour_tex: cache.from_opt_info(pbr.base_color_texture()),
+        normal_tex: cache.from_normal_texture(material.normal_texture()),
+        metallic_roughness_tex: cache.from_opt_info(pbr.metallic_roughness_texture()),
+        ao_tex: cache.from_ao_texture(material.occlusion_texture()),
+        emissive_tex: cache.from_opt_info(material.emissive_texture()),
+        flags,
     }
-
-    MaterialAsset::new(
-        pbr.base_color_factor()[0..3].try_into().unwrap(),
-        pbr.metallic_factor(),
-        pbr.roughness_factor(),
-        cache.from_opt_info(pbr.base_color_texture()),
-        cache.from_normal_texture(material.normal_texture()),
-        cache.from_opt_info(pbr.metallic_roughness_texture()),
-        cache.from_ao_texture(material.occlusion_texture()),
-        behaviour,
-    )
 }
 
 fn mip_count(width: u32, height: u32) -> u32 {
@@ -656,6 +640,7 @@ fn process_node(
     vertices: &mut Vec<StandardMeshVertex>,
     indices: &mut Vec<u32>,
     submeshes: &mut Vec<SubmeshCpu>,
+    bounds: &mut Aabb,
     buffers: &[gltf::buffer::Data],
 ) -> Result<(), MeshLoadError> {
     let local = gltf_matrix_to_na(&node.transform().matrix());
@@ -670,6 +655,7 @@ fn process_node(
                 .ok_or(MeshLoadError::MissingPositions)?;
             let normals = reader.read_normals();
             let uvs = reader.read_tex_coords(0);
+            let tangents = reader.read_tangents();
 
             let base_vertex = vertices.len() as u32;
 
@@ -679,8 +665,12 @@ fn process_node(
                 .unwrap_or_else(|| nalgebra::Matrix3::identity())
                 .transpose();
 
+            let mut local_positions = Vec::new();
             for (i, p) in positions.enumerate() {
-                let pos = world * Vector4::new(p[0], p[1], p[2], 1.0);
+                let local = Vector3::new(p[0], p[1], p[2]);
+                local_positions.push(local);
+
+                let pos = world * Vector4::new(local[0], local[1], local[2], 1.0);
 
                 let n = normals
                     .as_ref()
@@ -694,10 +684,22 @@ fn process_node(
                     .and_then(|t| t.clone().into_f32().nth(i))
                     .unwrap_or([0.0, 0.0]);
 
+                let t = tangents
+                    .as_ref()
+                    .and_then(|t| t.clone().nth(i))
+                    .unwrap_or([0.0f32, 0.0f32, 0.0f32, 1.0f32]);
+
+                let n = Vector3::new(n[0], n[1], n[2]);
+                let tangent = Vector3::new(t[0], t[1], t[2]);
+                let sign = t[3].signum();
+                let b = Vector3::cross(&n, &tangent) * sign;
+
                 vertices.push(StandardMeshVertex::new(
                     [pos.x, pos.y, pos.z],
                     [n.x, n.y, n.z],
                     uv,
+                    [tangent.x, tangent.y, tangent.z],
+                    [b.x, b.y, b.z],
                 ));
             }
 
@@ -721,17 +723,29 @@ fn process_node(
             }
 
             let index_count = indices.len() as u32 - first_index;
+            let mut aabb = Aabb::empty();
+
+            for idx in indices[first_index as usize..(first_index + index_count) as usize].iter() {
+                let v = local_positions[(*idx - base_vertex) as usize];
+                aabb.grow(v);
+            }
 
             submeshes.push(SubmeshCpu {
                 first_index,
                 index_count,
                 material_index: primitive.material().index().unwrap_or(0) as u32,
+                aabb,
             });
+
+            bounds.grow(aabb.min);
+            bounds.grow(aabb.max);
         }
     }
 
     for child in node.children() {
-        process_node(&child, &world, vertices, indices, submeshes, buffers)?;
+        process_node(
+            &child, &world, vertices, indices, submeshes, bounds, buffers,
+        )?;
     }
 
     Ok(())

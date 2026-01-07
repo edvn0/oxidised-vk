@@ -2,6 +2,11 @@ use crate::input_state::InputState;
 use crate::math::perspective;
 use nalgebra::{Matrix4, Point3, Vector3};
 
+pub struct Ray {
+    pub origin: glm::Vec3,
+    pub direction: glm::Vec3,
+}
+
 pub struct Camera {
     pub position: Vector3<f32>,
     pub forward: Vector3<f32>,
@@ -103,5 +108,24 @@ impl Camera {
         let sun_view = (view_rot * sun_world).normalize();
 
         [sun_view.x, sun_view.y, sun_view.z, 0.0]
+    }
+
+    pub fn screen_ray(&self, ndc_x: f32, ndc_y: f32, aspect: f32) -> Ray {
+        let proj = self.projection_matrix(aspect);
+
+        let inv = (proj * self.view_matrix()).try_inverse().unwrap();
+
+        let near = inv * glm::vec4(ndc_x, ndc_y, -1.0, 1.0);
+        let far = inv * glm::vec4(ndc_x, ndc_y, 1.0, 1.0);
+
+        let near = near.xyz() / near.w;
+        let far = far.xyz() / far.w;
+
+        let direction = far - near;
+
+        Ray {
+            origin: near,
+            direction: glm::normalize(&direction),
+        }
     }
 }

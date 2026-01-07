@@ -10,6 +10,10 @@ pub struct StandardMeshVertex {
     uvs: [f32; 2],
     #[format(R32G32B32_SFLOAT)]
     normal: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    tangent: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    bitangent: [f32; 3],
 }
 
 #[derive(BufferContents, Vertex, Clone, Copy, Default)]
@@ -20,11 +24,19 @@ pub struct PositionMeshVertex {
 }
 
 impl StandardMeshVertex {
-    pub fn new(position: [f32; 3], normal: [f32; 3], uvs: [f32; 2]) -> Self {
+    pub fn new(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uvs: [f32; 2],
+        tangent: [f32; 3],
+        bitangent: [f32; 3],
+    ) -> Self {
         Self {
             position,
             uvs,
             normal,
+            tangent,
+            bitangent,
         }
     }
 }

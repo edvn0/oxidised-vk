@@ -1,6 +1,6 @@
 use dear_imgui_rs::{self as imgui, Drag, Key};
 use legion::*;
-use nalgebra::{Matrix4, Perspective3, UnitQuaternion};
+use nalgebra::{Matrix4, UnitQuaternion};
 use std::any::TypeId;
 use std::collections::HashMap;
 
@@ -105,6 +105,14 @@ impl ScenePanel {
             gizmo_enabled: true,
             gizmo_using: false,
         }
+    }
+
+    pub fn select(&mut self, uuid: EntityUuid) {
+        self.selected_entity_uuid = Some(uuid);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected_entity_uuid = None;
     }
 
     /// Find Legion Entity from EntityUuid
@@ -330,10 +338,20 @@ impl ScenePanel {
     }
 
     /// Draw the gizmo in viewport space - call this after all other UI
-    pub fn draw_gizmo(&mut self, ui: &imgui::Ui, camera: &Camera, world: &mut World) {
+    pub fn draw_gizmo(
+        &mut self,
+        ui: &imgui::Ui,
+        camera: &Camera,
+        world: &mut World,
+        viewport_rect: Option<([f32; 2], [f32; 2])>,
+    ) {
         if !self.gizmo_enabled {
             return;
         }
+
+        let Some((vp_pos, vp_size)) = viewport_rect else {
+            return;
+        };
 
         let Some(selected_uuid) = self.selected_entity_uuid else {
             return;
@@ -358,10 +376,7 @@ impl ScenePanel {
         };
 
         let gizmo = ui.guizmo();
-        let ds = ui.io().display_size();
-
-        // Use FULL SCREEN coordinates
-        gizmo.set_rect(0.0, 0.0, ds[0], ds[1]);
+        gizmo.set_rect(vp_pos[0], vp_pos[1], vp_size[0], vp_size[1]);
 
         gizmo.set_drawlist_background();
         gizmo.set_orthographic(false);
@@ -370,7 +385,7 @@ impl ScenePanel {
         let view = camera.view_matrix();
 
         // Use LEFT-HANDED projection for ImGuizmo
-        let proj_matrix = imgui_perspective(72.0, ds[0] / ds[1], 0.1, 1000.0);
+        let proj_matrix = imgui_perspective(72.0, vp_size[0] / vp_size[1], 0.1, 1000.0);
 
         fn matrix_to_array(m: Matrix4<f32>) -> [f32; 16] {
             m.as_slice().try_into().unwrap()

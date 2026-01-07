@@ -3,9 +3,11 @@ pub mod panel;
 pub mod serialisation;
 pub mod world_ext;
 
-use crate::components::{MaterialOverride, MeshComponent, Transform, Visible};
+use crate::camera::Ray;
+use crate::components::{Bounds, MaterialOverride, MeshComponent, Transform, Visible};
 use crate::scene::serialisation::scene_serialiser::SceneSerialiser;
 use legion::*;
+use nalgebra::Vector3;
 use std::io::Result as IoResult;
 use std::path::Path;
 
@@ -86,6 +88,33 @@ impl Scene {
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
+
+    fn world(&mut self) -> &World {
+        &self.world
+    }
+
+    pub fn pick(&self, ray: &Ray) -> Option<EntityUuid> {
+        let mut closest = None;
+        let mut best_t = f32::INFINITY;
+
+        let mut query = <(&Transform, &Visible, &Bounds, &EntityUuid)>::query();
+
+        for (transform, _visible, bounds, uuid) in query.iter(&self.world) {
+            for aabb in &bounds.submeshes {
+                let world_min = transform.apply_point(aabb.min);
+                let world_max = transform.apply_point(aabb.max);
+
+                if let Some(t) = ray_aabb(ray, world_min, world_max) {
+                    if t < best_t {
+                        best_t = t;
+                        closest = Some(*uuid);
+                    }
+                }
+            }
+        }
+
+        closest
+    }
 }
 
 #[system(for_each)]
@@ -103,4 +132,33 @@ fn collect_draws(
         override_material: material.map(|m| m.material_id),
         submesh: mesh.submeshes.clone(),
     });
+}
+
+pub fn ray_aabb(ray: &Ray, min: Vector3<f32>, max: Vector3<f32>) -> Option<f32> {
+    let inv_dir = Vector3::new(
+        1.0 / ray.direction.x,
+        1.0 / ray.direction.y,
+        1.0 / ray.direction.z,
+    );
+
+    let mut t1 = (min.x - ray.origin.x) * inv_dir.x;
+    let mut t2 = (max.x - ray.origin.x) * inv_dir.x;
+    let mut tmin = t1.min(t2);
+    let mut tmax = t1.max(t2);
+
+    t1 = (min.y - ray.origin.y) * inv_dir.y;
+    t2 = (max.y - ray.origin.y) * inv_dir.y;
+    tmin = tmin.max(t1.min(t2));
+    tmax = tmax.min(t1.max(t2));
+
+    t1 = (min.z - ray.origin.z) * inv_dir.z;
+    t2 = (max.z - ray.origin.z) * inv_dir.z;
+    tmin = tmin.max(t1.min(t2));
+    tmax = tmax.min(t1.max(t2));
+
+    if tmax >= tmin.max(0.0) {
+        Some(tmin.max(0.0))
+    } else {
+        None
+    }
 }

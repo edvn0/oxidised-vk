@@ -3,44 +3,30 @@
 
 struct GpuMaterial {
     vec4 base_color;
-    float metallic;
-    float roughness;
+
     uint base_color_tex;
     uint normal_tex;
     uint metallic_roughness_tex;
     uint ao_tex;
-    vec2 _padding;
+    uint emissive_tex;
     uint flags;
+
+    float metallic;
+    float roughness;
+    float ao;
+    float emissive;
+    float alpha_cutoff;
+
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint _pad3;
 };
 
-const uint HAS_BASE_COLOR        = 1u << 0;
-const uint HAS_NORMAL            = 1u << 1;
-const uint HAS_METALROUGH       = 1u << 2;
-const uint HAS_AO                = 1u << 3;
-
-bool has_base_color_texture(GpuMaterial m) {
-    return (m.flags & HAS_BASE_COLOR) != 0u;
-}
-
-bool has_normal_texture(GpuMaterial m) {
-    return (m.flags & HAS_NORMAL) != 0u;
-}
-
-bool has_metalrough_texture(GpuMaterial m) {
-    return (m.flags & HAS_METALROUGH) != 0u;
-}
-
-bool has_ao_texture(GpuMaterial m) {
-    return (m.flags & HAS_AO) != 0u;
-}
-
-bool uses_any_textures(GpuMaterial m) {
-    return m.flags != 0u;
-}
-
-bool uses_all_textures(GpuMaterial m) {
-    return (m.flags & (HAS_BASE_COLOR | HAS_NORMAL | HAS_METALROUGH | HAS_AO)) ==
-           (HAS_BASE_COLOR | HAS_NORMAL | HAS_METALROUGH | HAS_AO);
-}
+const uint MATERIAL_FLAG_DOUBLE_SIDED = 1 << 0;  // Disable backface culling
+const uint MATERIAL_FLAG_ALPHA_BLEND = 1 << 1;   // Use alpha blending
+const uint MATERIAL_FLAG_ALPHA_TEST = 1 << 2;    // Use alpha testing (cutoff)
+const uint MATERIAL_FLAG_UNLIT = 1 << 3;         // Skip lighting (emissive only)
+const uint MATERIAL_FLAG_CAST_SHADOWS = 1 << 4;  // Material casts shadows
 
 #endif

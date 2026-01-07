@@ -39,6 +39,8 @@ pub mod data {
         pub scissor: &'a Scissor,
         pub culling: Culling,
         pub winding: Winding,
+        pub time: f32,
+        pub time_delta: f32,
     }
 
     pub struct RenderResources<'a> {
@@ -98,6 +100,8 @@ pub mod recorder {
 }
 
 pub mod passes {
+    use dear_imgui_rs::ConfigFlags;
+
     use crate::{
         bloom_pass::{BloomPass, BloomSettings},
         render_passes::{
@@ -230,6 +234,7 @@ pub mod passes {
                 recorder.cmd,
                 frame.scissor,
                 self.bloom_enabled,
+                (frame.time, frame.time_delta),
                 self.settings,
             )
         }
@@ -294,6 +299,16 @@ pub mod passes {
                 recorder.cmd.end_debug_utils_label()?;
             }
 
+            if recorder
+                .imgui_context
+                .io()
+                .config_flags()
+                .contains(ConfigFlags::VIEWPORTS_ENABLE)
+            {
+                recorder.imgui_context.update_platform_windows();
+                recorder.imgui_context.render_platform_windows_default();
+            }
+
             Ok(())
         }
     }
@@ -310,6 +325,7 @@ pub mod recordings {
 
     use super::*;
 
+    // Albedo, Normal, Unused-Metallic-Roughness-AO, Depth
     const MRT_FRAMEBUFFER_COUNT: usize = 3;
 
     #[derive(Constructor)]
@@ -327,16 +343,48 @@ pub mod recordings {
         pub image_view: Arc<ImageView>,
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
     pub struct CompositeSettings {
         pub exposure: f32,
+        pub gamma: f32,
+
         pub bloom_strength: f32,
+
+        pub saturation: f32,
+        pub contrast: f32,
+        pub brightness: f32,
+
+        pub vignette_strength: f32,
+        pub vignette_radius: f32,
+
+        pub grain_strength: f32,
+        pub time: f32,
+
+        pub tonemap_operator: i32,
+        pub _pad0: i32,
     }
 
     impl Default for CompositeSettings {
         fn default() -> Self {
             Self {
                 exposure: 1.0,
-                bloom_strength: 1.0,
+                gamma: 2.2,
+
+                bloom_strength: 0.8,
+
+                saturation: 1.0,
+                contrast: 1.0,
+                brightness: 0.0,
+
+                vignette_strength: 0.25,
+                vignette_radius: 0.75,
+
+                grain_strength: 0.0,
+                time: 0.0,
+
+                tonemap_operator: 1,
+                _pad0: 0,
             }
         }
     }
@@ -591,6 +639,7 @@ pub mod recordings {
             builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
             scissor: &Scissor,
             bloom_enabled: bool,
+            timers: (f32, f32),
             settings: &CompositeSettings,
         ) -> RenderPassResult<()> {
             let set = if bloom_enabled {
@@ -599,9 +648,21 @@ pub mod recordings {
                 &self.disabled_set
             };
 
+            let (t, _) = timers;
+
             let pc = engine_shaders::composite::PC {
                 exposure: settings.exposure,
                 bloom_strength: settings.bloom_strength,
+                gamma: settings.gamma,
+                saturation: settings.saturation,
+                contrast: settings.contrast,
+                brightness: settings.brightness,
+                vignette_strength: settings.vignette_strength,
+                vignette_radius: settings.vignette_radius,
+                grain_strength: settings.grain_strength,
+                time: t,
+                tonemap_operator: settings.tonemap_operator,
+                _pad0: settings._pad0,
             };
 
             builder

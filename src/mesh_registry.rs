@@ -40,6 +40,11 @@ impl MeshRegistry {
         self.name_to_handle.get(name).copied()
     }
 
+    pub fn resolve_and_get(&self, name: &str) -> Option<(&Arc<MeshAsset>, MeshHandle)> {
+        let handle = self.resolve(name);
+        handle.and_then(|handle| self.get(handle).ok().map(|mesh| (mesh, handle)))
+    }
+
     pub fn get(&self, handle: MeshHandle) -> Result<&Arc<MeshAsset>, String> {
         self.meshes
             .get(handle.0 as usize)

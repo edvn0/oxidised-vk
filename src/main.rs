@@ -1,4 +1,5 @@
 extern crate nalgebra_glm as glm;
+mod aabb;
 mod bloom_pass;
 mod camera;
 mod components;
@@ -21,9 +22,10 @@ mod windowing;
 
 use crate::bloom_pass::{BloomPass, BloomSettings};
 use crate::camera::Camera;
-use crate::components::{MeshComponent, Visible};
+use crate::components::{Bounds, MeshComponent, Visible};
 use crate::image::{ImageDimensions, ImageInfo, create_image};
 use crate::imgui::renderer::ImGuiRenderer;
+use crate::imgui::settings::Settings;
 use crate::input_state::InputState;
 use crate::main_helpers::{FrameDescriptorSet, generate_identity_lut_3d};
 use crate::mesh::{ImageViewSampler, MaterialClass, load_meshes_from_directory};
@@ -46,9 +48,13 @@ use crate::shader_bindings::{RendererUBO, renderer_set_0_layouts};
 use crate::submission::{FrameSubmission, SubmeshSelection};
 use crate::vertex::{PositionMeshVertex, StandardMeshVertex};
 use crate::windowing::set_window_icons;
-use dear_imgui_rs::{Condition, Context};
+use dear_imgui_rs::{
+    BackendFlags, Color, Condition, ConfigFlags, Context, Id, MouseButton, StyleVar, TextureId, Ui,
+    WindowFlags,
+};
 use dear_imgui_winit::{HiDpiMode, WinitPlatform};
 use glm::vec3;
+use gltf::texture;
 use nalgebra::{Translation3, UnitQuaternion};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
@@ -59,6 +65,7 @@ use std::{error::Error, sync::Arc};
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocatorCreateInfo;
 use vulkano::descriptor_set::layout::DescriptorType::{CombinedImageSampler, StorageBuffer};
+use vulkano::device::DeviceOwnedVulkanObject;
 use vulkano::format::FormatFeatures;
 use vulkano::image::sampler::{
     BorderColor, Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo,
@@ -145,6 +152,11 @@ struct AppUIState {
     post_process_panel: PostProcessPanel,
 }
 
+pub struct RenderSettings {
+    pub bloom: BloomSettings,
+    pub composite: CompositeSettings,
+}
+
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
@@ -169,11 +181,12 @@ struct App {
     lod_choice: usize,
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(BufferContents, Clone, Copy)]
 pub struct FrustumPlanes {
     pub planes: [[f32; 4]; 6],
 }
+const _: () = assert!(std::mem::size_of::<FrustumPlanes>() == 6 * 4 * 4);
 
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
@@ -622,8 +635,8 @@ impl ApplicationHandler for App {
         {
             let registry = mesh_registry.read().unwrap();
 
-            let viking_handle = registry.resolve("viking_room").unwrap();
-            let suzanne_handle = registry.resolve("suzanne").unwrap();
+            let (viking_mesh, viking_handle) = registry.resolve_and_get("viking_room").unwrap();
+            let (suzanne_mesh, suzanne_handle) = registry.resolve_and_get("suzanne").unwrap();
 
             for trs in generate_random_transforms(INSTANCE_COUNT / 2) {
                 self.scene.add_entity((
@@ -631,6 +644,9 @@ impl ApplicationHandler for App {
                     MeshComponent {
                         mesh: viking_handle,
                         submeshes: SubmeshSelection::All,
+                    },
+                    Bounds {
+                        submeshes: viking_mesh.submeshes.iter().map(|s| s.aabb).collect(),
                     },
                     Visible,
                 ));
@@ -643,6 +659,9 @@ impl ApplicationHandler for App {
                         mesh: suzanne_handle,
                         submeshes: SubmeshSelection::All,
                     },
+                    Bounds {
+                        submeshes: suzanne_mesh.submeshes.iter().map(|s| s.aabb).collect(),
+                    },
                     Visible,
                 ));
             }
@@ -654,6 +673,9 @@ impl ApplicationHandler for App {
                         mesh: viking_handle,
                         submeshes: SubmeshSelection::One(94),
                     },
+                    Bounds {
+                        submeshes: viking_mesh.submeshes.iter().map(|s| s.aabb).collect(),
+                    },
                     Visible,
                 ));
             }
@@ -664,7 +686,16 @@ impl ApplicationHandler for App {
             self.scene = Scene::load_from_file(Path::new("scene_save.scene")).unwrap();
         }
         let mut imgui = Context::create();
-        imgui.set_ini_filename(None::<&str>).unwrap();
+        imgui
+            .io_mut()
+            .backend_flags()
+            .insert(BackendFlags::RENDERER_HAS_VTX_OFFSET);
+        imgui.set_ini_filename(Some("imgui.ini")).unwrap();
+        {
+            let io = imgui.io_mut();
+            let old_flags = io.config_flags();
+            io.set_config_flags(old_flags | ConfigFlags::DOCKING_ENABLE);
+        }
 
         let mut renderer = ImGuiRenderer::new(
             self.device.clone(),
@@ -688,6 +719,11 @@ impl ApplicationHandler for App {
 
         window.set_visible(true);
 
+        let settings = RenderSettings {
+            bloom: BloomSettings::default(),
+            composite: CompositeSettings::default(),
+        };
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -708,9 +744,7 @@ impl ApplicationHandler for App {
             mrt_pass: mrt,
             mrt_lighting,
             composite,
-            composite_settings: CompositeSettings::default(),
             bloom_pass,
-            bloom_settings: BloomSettings::default(),
 
             frame_submission: FrameSubmission { draws: vec![] },
             meshes: mesh_registry,
@@ -721,6 +755,7 @@ impl ApplicationHandler for App {
             imgui_renderer: renderer,
             current_frame: 0,
             frames,
+            settings,
         });
     }
 
@@ -738,14 +773,8 @@ impl ApplicationHandler for App {
     ) {
         let rcx = self.rcx.as_mut().unwrap();
 
-        rcx.winit_platform.handle_event(
-            &mut rcx.imgui_context,
-            rcx.window.as_ref(),
-            &winit::event::Event::WindowEvent::<()> {
-                window_id: rcx.window.id(),
-                event: event.clone(),
-            },
-        );
+        rcx.winit_platform
+            .handle_window_event(&mut rcx.imgui_context, rcx.window.as_ref(), &event);
 
         match &event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -763,20 +792,6 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyH) => {
                             self.clockwise_front_face = self.clockwise_front_face.toggle();
                             println!("Winding: {:?}", self.clockwise_front_face);
-                        }
-                        PhysicalKey::Code(KeyCode::KeyY) => {
-                            let registry = self.rcx.as_ref().unwrap().meshes.read().unwrap();
-
-                            let lod_count = registry
-                                .resolve("viking_room")
-                                .map(|m| registry.get(m))
-                                .unwrap()
-                                .unwrap()
-                                .lods
-                                .len();
-
-                            self.lod_choice = (self.lod_choice + 1) % lod_count;
-                            println!("LOD set to {}", self.lod_choice);
                         }
                         _ => {}
                     }
@@ -833,71 +848,176 @@ impl ApplicationHandler for App {
     }
 }
 
-impl App {
-    fn render_frame(&mut self) {
-        let rcx = self.rcx.as_mut().unwrap();
+struct UiFrameOutput {
+    viewport_rect: Option<([f32; 2], [f32; 2])>,
+    viewport_hovered: bool,
+}
 
+impl App {
+    fn begin_frame(&mut self) -> f32 {
         let now = Instant::now();
         let mut dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
         dt = dt.clamp(0.0, 0.05);
+        dt
+    }
+
+    fn build_ui(&mut self) -> UiFrameOutput {
+        let rcx = self.rcx.as_mut().unwrap();
 
         let ui = rcx.imgui_context.frame();
-        let ui_wants_mouse = ui.io().want_capture_mouse();
-        let gizmo_wants_mouse = self.scene_panel.is_gizmo_using();
-        self.input_state.suppress_mouse = ui_wants_mouse || gizmo_wants_mouse;
-        ui.window("Hello world")
-            .size([300.0, 100.0], Condition::FirstUseEver)
+        Self::draw_dockspace(&ui);
+
+        let mut output = UiFrameOutput {
+            viewport_rect: None,
+            viewport_hovered: false,
+        };
+
+        let texture_id = rcx.imgui_renderer.texture_id(&rcx.composite.image_view);
+        Self::draw_viewport_window(texture_id, &ui, &mut output);
+
+        Self::draw_panels(
+            &ui,
+            &mut rcx.settings,
+            &mut self.scene_panel,
+            &self.camera,
+            &mut self.scene,
+            &mut self.ui_state,
+            &output,
+        );
+
+        rcx.winit_platform
+            .prepare_render(&mut rcx.imgui_context, &rcx.window);
+
+        output
+    }
+
+    fn draw_viewport_window(texture_id: TextureId, ui: &Ui, out: &mut UiFrameOutput) {
+        let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+        let _space = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+
+        ui.window("Viewport")
+            .flags(WindowFlags::NO_SCROLLBAR | WindowFlags::NO_SCROLL_WITH_MOUSE)
             .build(|| {
-                ui.text("Hello world!");
-                ui.text("こんにちは世界！");
-                ui.text("This...is...imgui-rs!");
-                ui.text(format!("FPS: {:?}", ui.io().framerate()));
-                ui.separator();
-                let mouse_pos = ui.io().mouse_pos();
-                ui.text(format!(
-                    "Mouse Position: ({:.1},{:.1})",
-                    mouse_pos[0], mouse_pos[1]
-                ));
+                let pos = ui.window_pos();
+                let avail = ui.content_region_avail();
+                let size = [avail[0].max(1.0), avail[1].max(1.0)];
+
+                out.viewport_rect = Some((pos, size));
+
+                let mouse = ui.io().mouse_pos();
+                out.viewport_hovered = mouse[0] >= pos[0]
+                    && mouse[1] >= pos[1]
+                    && mouse[0] <= pos[0] + size[0]
+                    && mouse[1] <= pos[1] + size[1];
+
+                ui.image(texture_id, size);
             });
+    }
+
+    fn draw_panels(
+        ui: &Ui,
+        settings: &mut RenderSettings,
+        scene_panel: &mut ScenePanel,
+        camera: &Camera,
+        scene: &mut Scene,
+        ui_state: &mut AppUIState,
+        ui_output: &UiFrameOutput,
+    ) {
+        scene_panel.draw(ui, scene.world_mut());
+        scene_panel.handle_input(ui);
+        scene_panel.draw_gizmo(ui, camera, scene.world_mut(), ui_output.viewport_rect);
 
         ui.window("Post Processing").build(|| {
-            let preview = match self.ui_state.post_process_panel {
+            let preview = match ui_state.post_process_panel {
                 PostProcessPanel::Bloom => "Bloom",
                 PostProcessPanel::Composite => "Composite",
             };
 
             if let Some(_cb) = ui.begin_combo("Effect", preview) {
                 if ui.selectable("Bloom") {
-                    self.ui_state.post_process_panel = PostProcessPanel::Bloom;
+                    ui_state.post_process_panel = PostProcessPanel::Bloom;
                 }
                 if ui.selectable("Composite") {
-                    self.ui_state.post_process_panel = PostProcessPanel::Composite;
+                    ui_state.post_process_panel = PostProcessPanel::Composite;
                 }
             }
 
             ui.separator();
 
-            match self.ui_state.post_process_panel {
+            match ui_state.post_process_panel {
                 PostProcessPanel::Bloom => {
-                    rcx.bloom_settings.ui(ui);
+                    settings.bloom.ui(ui);
                 }
                 PostProcessPanel::Composite => {
-                    rcx.composite_settings.ui(ui);
+                    settings.composite.ui(ui);
                 }
             }
         });
-        self.scene_panel.draw(ui, self.scene.world_mut());
-        self.scene_panel.handle_input(ui);
-        self.scene_panel
-            .draw_gizmo(ui, &self.camera, self.scene.world_mut());
+    }
 
-        rcx.winit_platform
-            .prepare_render(&mut rcx.imgui_context, &rcx.window);
+    fn handle_viewport_input(&mut self, ui: &UiFrameOutput) {
+        let ui_wants_mouse = self
+            .rcx
+            .as_ref()
+            .unwrap()
+            .imgui_context
+            .io()
+            .want_capture_mouse();
+        let gizmo = self.scene_panel.is_gizmo_using();
+
+        self.input_state.suppress_mouse = (!ui.viewport_hovered && ui_wants_mouse) || gizmo;
+
+        if self.input_state.rotating {
+            return;
+        }
+
+        if let Some((pos, size)) = ui.viewport_rect {
+            self.try_pick(pos, size);
+        }
+    }
+
+    fn try_pick(&mut self, viewport_pos: [f32; 2], viewport_size: [f32; 2]) {
+        let io = self.rcx.as_ref().unwrap().imgui_context.io();
+
+        if !io.mouse_down_button(MouseButton::Left) {
+            return;
+        }
+
+        let mouse = io.mouse_pos();
+
+        let local_x = mouse[0] - viewport_pos[0];
+        let local_y = mouse[1] - viewport_pos[1];
+
+        if local_x < 0.0
+            || local_y < 0.0
+            || local_x > viewport_size[0]
+            || local_y > viewport_size[1]
+        {
+            return;
+        }
+
+        let ndc_x = (2.0 * local_x / viewport_size[0]) - 1.0;
+        let ndc_y = 1.0 - (2.0 * local_y / viewport_size[1]);
+        let aspect = viewport_size[0] / viewport_size[1];
+
+        let ray = self.camera.screen_ray(ndc_x, ndc_y, aspect);
+
+        if let Some(uuid) = self.scene.pick(&ray) {
+            self.scene_panel.select(uuid);
+        } else {
+            self.scene_panel.clear_selection();
+        }
+    }
+
+    fn render_frame(&mut self) {
+        let dt = self.begin_frame();
+        let ui = self.build_ui();
+        self.handle_viewport_input(&ui);
+
+        let rcx = self.rcx.as_mut().unwrap();
         rcx.frame_submission.clear_all();
-
         self.scene.update();
-
         let mut submission = self
             .scene
             .resources_mut()
@@ -973,12 +1093,16 @@ impl App {
 
         rcx.update_camera_ubo(&self.camera, rcx.current_frame, window_size);
 
+        let time_delta = dt;
+        let time = rcx.start_time.elapsed().as_secs_f32();
         let frame = FrameContext {
             _frame_index: rcx.current_frame,
             viewport: &rcx.viewport,
             scissor: &rcx.scissor,
             culling: self.cull_backfaces,
             winding: self.clockwise_front_face,
+            time,
+            time_delta,
         };
 
         let mut recorder = RenderRecorder {
@@ -1006,18 +1130,18 @@ impl App {
             },
             &BloomEffectPass {
                 bloom: &rcx.bloom_pass,
-                settings: &rcx.bloom_settings,
+                settings: &rcx.settings.bloom,
                 input_image: &rcx.mrt_lighting.image_view,
             },
             &CompositePass {
                 composite: &rcx.composite,
-                bloom_enabled: rcx.bloom_settings.enabled,
-                settings: &rcx.composite_settings,
+                bloom_enabled: rcx.settings.bloom.enabled,
+                settings: &rcx.settings.composite,
             },
-            &PresentPass {
+            /*&PresentPass {
                 swapchain: &rcx.swapchain_pass,
                 image_index: image_index.try_into().unwrap(),
-            },
+            },*/
             &ImGuiPass {
                 image_index: image_index.try_into().unwrap(),
             },
@@ -1058,6 +1182,15 @@ impl App {
 
         rcx.current_frame = (rcx.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
+
+    fn draw_dockspace(ui: &Ui) {
+        let dockspace_id = ui.get_id("MainDockSpace");
+
+        ui.dockspace_over_main_viewport_with_flags(
+            dockspace_id,
+            dear_imgui_rs::DockNodeFlags::NONE,
+        );
+    }
 }
 
 fn window_size_dependent_setup(
@@ -1068,6 +1201,41 @@ fn window_size_dependent_setup(
     default_black_texture: Arc<ImageViewSampler>,
     swapchain_images: &[Arc<Image>],
 ) -> (SwapchainPass, MRT, MRTLighting, Composite, BloomPass) {
+    let lut = {
+        let lut_size: u32 = 32;
+
+        let value = generate_identity_lut_3d(lut_size);
+
+        let lut_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                unnormalized_coordinates: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let image_info = ImageInfo {
+            dimensions: ImageDimensions::Dim3d([lut_size, lut_size, lut_size]),
+            format: Format::R8G8B8A8_UNORM,
+            mips: Some(1),
+            sampler: lut_sampler.clone(),
+            debug_name: "identity_lut_3d".to_string(),
+        };
+
+        let lut_texture = create_image(
+            upload.queue.clone(),
+            upload.command_buffer_allocator.clone(),
+            upload.memory_allocator.clone(),
+            &value,
+            image_info,
+        );
+
+        lut_texture
+    };
+
     let predepth_pipeline = {
         let vs = engine_shaders::predepth::vs::load(device.clone())
             .unwrap()
@@ -1272,6 +1440,17 @@ fn window_size_dependent_setup(
         })
         .collect();
 
+    // Lets name the gbuffer_images
+    gbuffer_images[0]
+        .set_debug_utils_object_name(Some("GBuffer Albedo"))
+        .unwrap();
+    gbuffer_images[1]
+        .set_debug_utils_object_name(Some("GBuffer Normal"))
+        .unwrap();
+    gbuffer_images[2]
+        .set_debug_utils_object_name(Some("GBuffer Material"))
+        .unwrap();
+
     let depth_image = Image::new(
         upload.memory_allocator.clone(),
         ImageCreateInfo {
@@ -1284,6 +1463,10 @@ fn window_size_dependent_setup(
         AllocationCreateInfo::default(),
     )
     .unwrap();
+
+    depth_image
+        .set_debug_utils_object_name(Some("Depth Image"))
+        .unwrap();
 
     let to_view = |img: Arc<Image>| {
         ImageView::new(
@@ -1520,6 +1703,12 @@ fn window_size_dependent_setup(
                         b.stages = ShaderStages::FRAGMENT;
                         b
                     }),
+                    (2, {
+                        let mut b =
+                            DescriptorSetLayoutBinding::descriptor_type(CombinedImageSampler);
+                        b.stages = ShaderStages::FRAGMENT;
+                        b
+                    }),
                 ]),
                 ..Default::default()
             },
@@ -1540,6 +1729,7 @@ fn window_size_dependent_setup(
                     bloom_pass.result(), // bloom mip 0 (after upsample accumulation)
                     default_white_texture.sampler.clone(),
                 ),
+                WriteDescriptorSet::image_view_sampler(2, lut.view.clone(), lut.sampler.clone()),
             ],
             [],
         )
@@ -1559,6 +1749,7 @@ fn window_size_dependent_setup(
                     default_black_texture.view.clone(),
                     default_black_texture.sampler.clone(),
                 ),
+                WriteDescriptorSet::image_view_sampler(2, lut.view.clone(), lut.sampler.clone()),
             ],
             [],
         )
@@ -1700,37 +1891,6 @@ fn window_size_dependent_setup(
         )
         .unwrap();
 
-        let lut_size: u32 = 32;
-
-        let value = generate_identity_lut_3d(lut_size);
-
-        let lut_sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                unnormalized_coordinates: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let image_info = ImageInfo {
-            dimensions: ImageDimensions::Dim3d([lut_size, lut_size, lut_size]),
-            format: Format::R8G8B8A8_UNORM,
-            mips: Some(1),
-            sampler: lut_sampler.clone(),
-            debug_name: "identity_lut_3d".to_string(),
-        };
-
-        let lut_texture = create_image(
-            upload.queue.clone(),
-            upload.command_buffer_allocator.clone(),
-            upload.memory_allocator.clone(),
-            &value,
-            image_info,
-        );
-
         let set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
             descriptor_layout.clone(),
@@ -1740,11 +1900,7 @@ fn window_size_dependent_setup(
                     composite.image_view.clone(),
                     default_white_texture.sampler.clone(),
                 ),
-                WriteDescriptorSet::image_view_sampler(
-                    1,
-                    lut_texture.view.clone(),
-                    lut_texture.sampler.clone(),
-                ),
+                WriteDescriptorSet::image_view_sampler(1, lut.view.clone(), lut.sampler.clone()),
             ],
             [],
         )
